@@ -1,0 +1,111 @@
+name: 🔍 View App Logs - bridgeapitvchc (cerbatest)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Seconds to stream logs (10-300)'
+        required: false
+        default: '60'
+      show_history:
+        description: 'Show historical logs first?'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  stream-logs:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+    - name: Login to Azure
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_F5F5A6E02E354120832116BFC283EE84 }}
+        tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_01DCCA571C8B42BB99944956DE4E4C30 }}
+        subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_3C131C394D8047A18583542BA6679F18 }}
+    
+    - name: 🔧 Enable Application Logging
+      run: |
+        echo "🔧 Configuring logging for cerbatest slot..."
+        az webapp log config \
+          --name bridgeapitvchc \
+          --resource-group $(az webapp list --query "[?name=='bridgeapitvchc'].resourceGroup" -o tsv) \
+          --slot cerbatest \
+          --application-logging filesystem \
+          --level verbose \
+          --detailed-error-messages true \
+          --failed-request-tracing true
+        echo "✅ Logging configured for cerbatest"
+        echo ""
+    
+    - name: 📜 Show Recent Historical Logs
+      if: ${{ github.event.inputs.show_history == 'true' }}
+      run: |
+        echo "================================================"
+        echo "📜 RECENT LOGS FROM CERBATEST SLOT"
+        echo "================================================"
+        
+        az webapp log download \
+          --name bridgeapitvchc \
+          --resource-group $(az webapp list --query "[?name=='bridgeapitvchc'].resourceGroup" -o tsv) \
+          --slot cerbatest \
+          --log-file recent.zip 2>/dev/null || echo "No historical logs available"
+        
+        if [ -f recent.zip ]; then
+          unzip -q recent.zip
+          find . -name "*.txt" -o -name "*.log" | while read file; do
+            if [ -s "$file" ]; then
+              echo "--- Recent entries ---"
+              tail -50 "$file" 2>/dev/null || true
+              echo ""
+            fi
+          done
+        fi
+        echo ""
+    
+    - name: 🔴 LIVE STREAMING - cerbatest Slot
+      run: |
+        echo "================================================"
+        echo "🔴 LIVE LOG STREAM - CERBATEST SLOT"
+        echo "================================================"
+        echo "📍 App: bridgeapitvchc"
+        echo "📍 Slot: cerbatest (TEST ENVIRONMENT)"
+        echo "📍 Duration: ${{ github.event.inputs.duration }} seconds"
+        echo "================================================"
+        echo ""
+        echo "👀 Watching for:"
+        echo "   • Python print() statements"
+        echo "   • logging.info/error/debug messages"
+        echo "   • Uncaught exceptions"
+        echo "   • HTTP requests"
+        echo ""
+        echo "🚀 STREAMING LIVE FROM CERBATEST..."
+        echo "------------------------------------------------"
+        
+        timeout ${{ github.event.inputs.duration }}s \
+          az webapp log tail \
+            --name bridgeapitvchc \
+            --resource-group $(az webapp list --query "[?name=='bridgeapitvchc'].resourceGroup" -o tsv) \
+            --slot cerbatest 2>&1 || true
+        
+        echo ""
+        echo "------------------------------------------------"
+        echo "✅ Live streaming from cerbatest completed"
+    
+    - name: 📊 Summary
+      if: always()
+      run: |
+        echo ""
+        echo "================================================"
+        echo "📊 LOG SESSION SUMMARY"
+        echo "================================================"
+        echo "✅ Log streaming completed for CERBATEST slot"
+        echo "📍 Duration: ${{ github.event.inputs.duration }} seconds"
+        echo ""
+        echo "💡 To see logs again, re-run this workflow"
+        echo "💡 Add print() statements in your Python code to debug"
+        echo "================================================"
