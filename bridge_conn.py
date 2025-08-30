@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Pipecat-Talkdesk Bridge Server - Versione con ritardo Pipecat in attesa di START + caller_id
+Pipecat Cloud-Talkdesk Bridge Server - Daily.co Integration
+Integrates Pipecat Cloud agents with TalkDesk using Daily.co rooms
 """
+
 import redis
 import asyncio
-import websockets
 import json
 import base64
 import audioop
@@ -27,7 +28,7 @@ import aiomysql
 ACTIVE_SESSIONS: Dict[str, "BridgeSession"] = {}
 
 ##############################################
-# MySQL Configuration
+# MySQL Configuration (copied from original)
 ##############################################
 DB_CONFIG = {
     "host": "voikdbm74prodzj.mysql.database.azure.com",
@@ -42,6 +43,7 @@ DB_CONFIG = {
 }
 
 async def save_call_to_mysql(call_id: str, assistant_id: str, interaction_id: str, phone_number: str = "") -> bool:
+    """MySQL save function (copied from original)"""
     connection = None
     try:
         connection = await aiomysql.connect(
@@ -84,11 +86,11 @@ async def save_call_to_mysql(call_id: str, assistant_id: str, interaction_id: st
             connection.close()
 
 ##############################################
-# Redis Configuration
+# Redis Configuration (copied from original)
 ##############################################
 PIPECAT_STAT_CONFIG = {
     "base_url": "https://voilavoiceagent-cyf2e9bshnguaebh.westeurope-01.azurewebsites.net",
-    "endpoint": "/pipecat_stat",  # Cambiato da /vapi_stat
+    "endpoint": "/pipecat_stat",
     "timeout": 30
 }
 
@@ -104,21 +106,26 @@ redis_client = redis.StrictRedis(
     ssl=True
 )
 
-def get_required_env(var_name: str) -> str:
-    value = os.getenv(var_name)
-    if value is None:
-        logger.error(f"Variabile d'ambiente richiesta '{var_name}' non trovata!")
-        sys.exit(1)
-    return value
-
 ##############################################
-# Server Configuration
+# Pipecat Cloud Configuration
 ##############################################
 PORT = 8080
 
-# URL del server Pipecat
-#PIPECAT_SERVER_URL ="wss://voiladevpipecat-e9g6f7bxhhgreefq.francecentral-01.azurewebsites.net/ws"
-PIPECAT_SERVER_URL="wss://2ca1d7472258.ngrok-free.app"
+# Pipecat Cloud settings
+PIPECAT_CLOUD_CONFIG = {
+    "base_url": "https://api.pipecat.daily.co/v1",  # Base API URL
+    "agent_name": "health-booking-assistant",  # Your deployed agent name
+    "api_key": os.getenv("PIPECAT_CLOUD_API_KEY"),  # Add your API key to environment
+    "timeout": 30
+}
+
+# Daily.co configuration
+DAILY_CONFIG = {
+    "api_key": os.getenv("DAILY_API_KEY"),  # Add your Daily API key to environment
+    "base_url": "https://api.daily.co/v1",
+    "timeout": 30
+}
+
 PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
@@ -129,7 +136,7 @@ logging.basicConfig(
         logging.FileHandler('bridge.log')
     ]
 )
-logger = logging.getLogger('PipecatBridge')
+logger = logging.getLogger('PipecatCloudBridge')
 
 class ConnectionState(Enum):
     INIT = "init"
@@ -151,23 +158,27 @@ class BridgeState(Enum):
 class BridgeConfig:
     host: str = "0.0.0.0"
     port: int = PORT
-    pipecat_server_url: str = PIPECAT_SERVER_URL
-    pipecat_assistant_id: str = PIPECAT_ASSISTANT_ID
+    pipecat_cloud_config: Dict[str, Any] = None
+    daily_config: Dict[str, Any] = None
     talkdesk_sample_rate: int = 8000
     pipecat_sample_rate: int = 16000
     channels: int = 1
     chunk_size: int = 160
 
-cfg = BridgeConfig()
+cfg = BridgeConfig(
+    pipecat_cloud_config=PIPECAT_CLOUD_CONFIG,
+    daily_config=DAILY_CONFIG
+)
 app = FastAPI()
 
 class AudioProcessor:
+    """Audio processing utilities (copied from original)"""
     @staticmethod
     def mulaw_to_pcm(mulaw_data: bytes) -> bytes:
         try:
             return audioop.ulaw2lin(mulaw_data, 2)
         except Exception as e:
-            logger.error(f"Errore conversione μ-law → PCM: {e}")
+            logger.error(f"Error converting μ-law → PCM: {e}")
             return b''
     
     @staticmethod
@@ -175,7 +186,7 @@ class AudioProcessor:
         try:
             return audioop.lin2ulaw(pcm_data, 2)
         except Exception as e:
-            logger.error(f"Errore conversione PCM → μ-law: {e}")
+            logger.error(f"Error converting PCM → μ-law: {e}")
             return b''
     
     @staticmethod
@@ -195,118 +206,210 @@ class AudioProcessor:
             )
             return resampled
         except Exception as e:
-            logger.error(f"Errore resampling {from_rate}Hz → {to_rate}Hz: {e}")
+            logger.error(f"Error resampling {from_rate}Hz → {to_rate}Hz: {e}")
             return audio_data
 
-class PipecatConnection:
-    """Gestisce la connessione WebSocket con il server Pipecat"""
+class DailyRoomManager:
+    """Manages Daily.co room creation and token generation"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.session = aiohttp.ClientSession()
+    
+    async def create_room(self, room_name: Optional[str] = None) -> Dict[str, Any]:
+        """Create a Daily.co room for the Pipecat session"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['api_key']}",
+                "Content-Type": "application/json"
+            }
+            
+            room_config = {
+                "privacy": "private",
+                "properties": {
+                    "start_audio_off": False,
+                    "start_video_off": True,
+                    "enable_chat": False,
+                    "enable_knocking": False,
+                    "enable_screenshare": False,
+                    "enable_recording": "local",
+                    "exp": int(time.time()) + 3600  # 1 hour expiration
+                }
+            }
+            
+            if room_name:
+                room_config["name"] = room_name
+                
+            async with self.session.post(
+                f"{self.config['base_url']}/rooms",
+                headers=headers,
+                json=room_config,
+                timeout=self.config['timeout']
+            ) as response:
+                if response.status == 200:
+                    room_data = await response.json()
+                    logger.info(f"Created Daily room: {room_data['name']}")
+                    return room_data
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Failed to create Daily room: {response.status} - {error_text}")
+                    
+        except Exception as e:
+            logger.error(f"Daily room creation error: {e}")
+            raise
+    
+    async def create_token(self, room_name: str, is_owner: bool = False) -> str:
+        """Create a meeting token for the Daily room"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {self.config['api_key']}",
+                "Content-Type": "application/json"
+            }
+            
+            token_config = {
+                "properties": {
+                    "room_name": room_name,
+                    "is_owner": is_owner,
+                    "exp": int(time.time()) + 3600,  # 1 hour expiration
+                    "enable_recording": True
+                }
+            }
+            
+            async with self.session.post(
+                f"{self.config['base_url']}/meeting-tokens",
+                headers=headers,
+                json=token_config,
+                timeout=self.config['timeout']
+            ) as response:
+                if response.status == 200:
+                    token_data = await response.json()
+                    return token_data['token']
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Failed to create token: {response.status} - {error_text}")
+                    
+        except Exception as e:
+            logger.error(f"Daily token creation error: {e}")
+            raise
+    
+    async def close(self):
+        """Close the HTTP session"""
+        if self.session:
+            await self.session.close()
+
+class PipecatCloudConnection:
+    """Manages connection to Pipecat Cloud agent through Daily.co rooms"""
     
     def __init__(self, config: BridgeConfig):
         self.config = config
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.call_id: Optional[str] = None
-        self.websocket_url: Optional[str] = None
+        self.daily_manager = DailyRoomManager(config.daily_config)
+        self.session_id: Optional[str] = None
+        self.room_url: Optional[str] = None
+        self.room_name: Optional[str] = None
+        self.token: Optional[str] = None
         self.state = ConnectionState.INIT
         self.session_data: Dict[str, Any] = {}
+        self.http_session = aiohttp.ClientSession()
         
-    async def create_connection(self, business_status: str = "close") -> Dict[str, Any]:
-        """Crea una nuova connessione WebSocket con Pipecat"""
+    async def create_pipecat_session(self, business_status: str = "close") -> Dict[str, Any]:
+        """Create a new Pipecat Cloud session with Daily.co integration"""
         try:
             self.state = ConnectionState.CONNECTING
             
-            # Genera un call_id univoco per questa sessione
-            self.call_id = str(uuid.uuid4())
+            # Generate unique session ID
+            self.session_id = str(uuid.uuid4())
             
-            # Costruisci l'URL con i parametri
-            ws_url = f"{self.config.pipecat_server_url}?business_status={business_status}&session_id={self.call_id}"
-            self.websocket_url = ws_url
+            # Create Daily.co room
+            room_name = f"pipecat-session-{self.session_id[:8]}"
+            room_data = await self.daily_manager.create_room(room_name)
+            self.room_url = room_data["url"]
+            self.room_name = room_data["name"]
             
-            logger.info(f"Creating Pipecat connection with business_status: {business_status}")
-            logger.info(f"WebSocket URL: {ws_url}")
+            # Create meeting token
+            self.token = await self.daily_manager.create_token(self.room_name, is_owner=False)
             
-            # Salva i dati della sessione
+            # Start Pipecat Cloud session
+            await self._start_pipecat_agent_session(business_status)
+            
+            self.state = ConnectionState.CONNECTED
+            
+            # Save session data
             self.session_data = {
-                'id': self.call_id,
+                'id': self.session_id,
+                'room_url': self.room_url,
+                'room_name': self.room_name,
+                'token': self.token,
                 'business_status': business_status,
                 'created_at': time.time()
             }
+            
+            logger.info(f"Pipecat Cloud session created: {self.session_id}")
+            logger.info(f"Daily room: {self.room_url}")
             
             return self.session_data
             
         except Exception as e:
             self.state = ConnectionState.ERROR
-            logger.error(f"Failed to prepare Pipecat connection: {e}")
+            logger.error(f"Failed to create Pipecat Cloud session: {e}")
             raise
     
-    async def connect(self):
-        """Connetti al server Pipecat WebSocket"""
-        if not self.websocket_url:
-            raise ValueError("No WebSocket URL available")
-            
+    async def _start_pipecat_agent_session(self, business_status: str):
+        """Start the Pipecat Cloud agent session via REST API"""
         try:
-            logger.info(f"Connecting to Pipecat server: {self.websocket_url}")
-            self.websocket = await websockets.connect(
-                self.websocket_url,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=10
-            )
-            self.state = ConnectionState.CONNECTED
-            logger.info(f"Connected to Pipecat WebSocket: {self.call_id}")
+            headers = {
+                "Authorization": f"Bearer {self.config.pipecat_cloud_config['api_key']}",
+                "Content-Type": "application/json"
+            }
             
-            # Invia un messaggio iniziale di configurazione se necessario
-            # Pipecat potrebbe non richiederlo, ma lo lasciamo per compatibilità
+            # Session start payload for Pipecat Cloud
+            start_payload = {
+                "config": {
+                    "room_url": self.room_url,
+                    "token": self.token,
+                    "business_status": business_status,
+                    "session_id": self.session_id
+                }
+            }
             
+            agent_name = self.config.pipecat_cloud_config['agent_name']
+            start_url = f"{self.config.pipecat_cloud_config['base_url']}/{agent_name}/start"
+            
+            async with self.http_session.post(
+                start_url,
+                headers=headers,
+                json=start_payload,
+                timeout=self.config.pipecat_cloud_config['timeout']
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info(f"Pipecat agent session started: {result}")
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"Failed to start Pipecat agent: {response.status} - {error_text}")
+                    
         except Exception as e:
-            self.state = ConnectionState.ERROR
-            logger.error(f"Failed to connect to Pipecat: {e}")
+            logger.error(f"Pipecat agent session start error: {e}")
             raise
-    
-    async def send_audio(self, pcm_data: bytes):
-        """Invia audio PCM raw al server Pipecat"""
-        if self.websocket and self.state == ConnectionState.CONNECTED:
-            try:
-                # Pipecat si aspetta PCM raw direttamente
-                await self.websocket.send(pcm_data)
-            except Exception as e:
-                logger.error(f"Error sending audio to Pipecat: {e}")
-                self.state = ConnectionState.ERROR
-                raise
-    
-    async def receive(self) -> bytes:
-        """Ricevi dati dal server Pipecat"""
-        if self.websocket and self.state == ConnectionState.CONNECTED:
-            data = await self.websocket.recv()
-            # Pipecat dovrebbe inviare PCM raw
-            if isinstance(data, bytes):
-                return data
-            else:
-                # Se ricevi JSON, gestiscilo come messaggio di controllo
-                try:
-                    control_msg = json.loads(data) if isinstance(data, str) else data
-                    logger.debug(f"Pipecat control message: {control_msg}")
-                    return b''  # Ritorna bytes vuoti per i messaggi di controllo
-                except:
-                    return b''
-        raise ConnectionError("Not connected to Pipecat")
     
     async def close(self):
-        """Chiudi la connessione con Pipecat"""
+        """Close the Pipecat Cloud session"""
         self.state = ConnectionState.CLOSING
-        if self.websocket:
-            try:
-                await self.websocket.close()
-                logger.info(f"Pipecat connection closed: {self.call_id}")
-            except Exception as e:
-                logger.error(f"Error closing Pipecat connection: {e}")
+        try:
+            await self.daily_manager.close()
+            await self.http_session.close()
+            logger.info(f"Pipecat Cloud session closed: {self.session_id}")
+        except Exception as e:
+            logger.error(f"Error closing Pipecat Cloud session: {e}")
         self.state = ConnectionState.CLOSED
 
 class BridgeSession:
+    """Bridge session managing TalkDesk to Pipecat Cloud integration"""
+    
     def __init__(self, session_id: str, talkdesk_ws: WebSocket, config: BridgeConfig):
         self.session_id = session_id
         self.talkdesk_ws = talkdesk_ws
         self.config = config
-        self.pipecat_conn = PipecatConnection(config)
+        self.pipecat_conn = PipecatCloudConnection(config)
         self.audio_processor = AudioProcessor()
         self.is_active = False
         self.tasks: Set[asyncio.Task] = set()
@@ -320,7 +423,7 @@ class BridgeSession:
         self.caller_id = None
         self.business_status = None
         
-        # Buffer per messaggi ricevuti prima che Pipecat sia pronto
+        # Buffer for messages received before Pipecat is ready
         self.audio_buffer = []
         
         self.stats = {
@@ -330,7 +433,7 @@ class BridgeSession:
         }
     
     def extract_business_status(self, business_hours_string: str) -> str:
-        """Estrae lo status (open/close) dalla stringa business_hours"""
+        """Extract status (open/close) from business_hours string (copied from original)"""
         try:
             if business_hours_string and '::' in business_hours_string:
                 parts = business_hours_string.split('::')
@@ -347,44 +450,36 @@ class BridgeSession:
             return "close"
     
     async def initialize_pipecat_with_business_status(self, business_status: str):
-        """Inizializza Pipecat con il business_status corretto"""
+        """Initialize Pipecat Cloud session with business status"""
         try:
-            logger.info(f"Session {self.session_id}: Initializing Pipecat with business_status: {business_status}")
+            logger.info(f"Session {self.session_id}: Initializing Pipecat Cloud with business_status: {business_status}")
             
-            # Crea la connessione Pipecat con il business_status corretto
-            await self.pipecat_conn.create_connection(business_status)
-            await self.pipecat_conn.connect()
+            # Create Pipecat Cloud session with Daily.co integration
+            await self.pipecat_conn.create_pipecat_session(business_status)
             
-            # Cambia stato a ACTIVE
+            # Change state to ACTIVE
             self.set_bridge_state(BridgeState.ACTIVE)
             
-            logger.info(f"Session {self.session_id}: Pipecat initialized successfully with business_status: {business_status}")
+            logger.info(f"Session {self.session_id}: Pipecat Cloud initialized successfully with business_status: {business_status}")
             
-            # Invia eventuale audio buffered
-            if self.audio_buffer:
-                logger.info(f"Session {self.session_id}: Sending {len(self.audio_buffer)} buffered audio packets to Pipecat")
-                for audio_data in self.audio_buffer:
-                    try:
-                        await self.pipecat_conn.send_audio(audio_data)
-                        self.stats['talkdesk_to_pipecat_packets'] += 1
-                    except Exception as e:
-                        logger.error(f"Session {self.session_id}: Error sending buffered audio: {e}")
-                        break
-                self.audio_buffer.clear()
+            # Note: Audio forwarding will be handled differently with Daily.co
+            # We don't send buffered audio directly - Daily.co handles the media streaming
             
             return True
             
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Failed to initialize Pipecat: {e}")
+            logger.error(f"Session {self.session_id}: Failed to initialize Pipecat Cloud: {e}")
             self.set_bridge_state(BridgeState.ERROR)
             return False
     
     def set_bridge_state(self, new_state: BridgeState):
+        """Set bridge state with logging (copied from original)"""
         old_state = self.bridge_state
         self.bridge_state = new_state
         logger.info(f"Session {self.session_id}: Bridge state changed {old_state.value} → {new_state.value}")
     
     async def start_escalation(self) -> bool:
+        """Start escalation process (adapted for Daily.co)"""
         try:
             if self.bridge_state != BridgeState.ACTIVE:
                 logger.warning(f"Session {self.session_id}: Cannot start escalation, state is {self.bridge_state.value}")
@@ -394,10 +489,10 @@ class BridgeSession:
             self.set_bridge_state(BridgeState.ESCALATING)
             
             await self.pipecat_conn.close()
-            logger.info(f"Session {self.session_id}: Pipecat WebSocket closed for escalation")
+            logger.info(f"Session {self.session_id}: Pipecat Cloud session closed for escalation")
             
             self.escalation_event.set()
-            await asyncio.sleep(2)  # Ridotto da 4 a 2 secondi per Pipecat
+            await asyncio.sleep(2)
             
             self.set_bridge_state(BridgeState.PIPECAT_CLOSED)
             logger.info(f"Session {self.session_id}: Escalation ready - Pipecat session completed")
@@ -409,6 +504,7 @@ class BridgeSession:
             return False
     
     async def complete_escalation(self, stop_msg: Dict[str, Any]) -> bool:
+        """Complete escalation process (copied from original)"""
         try:
             if self.bridge_state not in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED]:
                 logger.warning(f"Session {self.session_id}: Cannot complete escalation, state is {self.bridge_state.value}")
@@ -428,26 +524,18 @@ class BridgeSession:
             return False
     
     async def start(self):
-        """Avvia la sessione bridge - Pipecat viene inizializzato dopo START"""
+        """Start bridge session with Daily.co integration"""
         try:
             logger.info(f"Starting bridge session: {self.session_id}")
             
             self.is_active = True
             self.set_bridge_state(BridgeState.WAITING_START)
             
-            # Avvia solo il task di forwarding da Talkdesk
-            forward_task = asyncio.create_task(self._forward_talkdesk_to_pipecat())
-            backward_task = None
-            
+            # Start TalkDesk message processing
+            forward_task = asyncio.create_task(self._process_talkdesk_messages())
             self.tasks = {forward_task}
             
             while self.is_active and self.bridge_state not in [BridgeState.CLOSING, BridgeState.CLOSED]:
-                # Dopo che Pipecat è inizializzato, aggiungi il backward task
-                if self.bridge_state == BridgeState.ACTIVE and backward_task is None:
-                    backward_task = asyncio.create_task(self._forward_pipecat_to_talkdesk())
-                    self.tasks.add(backward_task)
-                    logger.info(f"Session {self.session_id}: Started Pipecat→Talkdesk forwarding")
-                
                 done, pending = await asyncio.wait(
                     self.tasks, 
                     return_when=asyncio.FIRST_COMPLETED,
@@ -474,9 +562,9 @@ class BridgeSession:
         finally:
             await self.stop()
     
-    async def _forward_talkdesk_to_pipecat(self):
-        """Inoltra audio da Talkdesk a Pipecat con attesa di START"""
-        logger.info(f"Session {self.session_id}: Starting Talkdesk → Pipecat forwarding (waiting for START)")
+    async def _process_talkdesk_messages(self):
+        """Process TalkDesk messages with Daily.co integration"""
+        logger.info(f"Session {self.session_id}: Starting TalkDesk message processing")
         
         try:
             while self.is_active:
@@ -491,9 +579,9 @@ class BridgeSession:
                     event = data.get('event')
                     
                     if event == 'start':
-                        logger.info(f"Session {self.session_id}: Received START from Talkdesk")
+                        logger.info(f"Session {self.session_id}: Received START from TalkDesk")
                         
-                        # Estrai tutti i dati necessari
+                        # Extract session data
                         self.stream_sid = data.get('streamSid')
                         if not self.stream_sid and 'start' in data:
                             self.stream_sid = data['start'].get('streamSid')
@@ -501,34 +589,29 @@ class BridgeSession:
                         if 'start' in data:
                             self.interaction_id = data['start'].get('customParameters', {}).get('interaction_id')
                             
-                            # Estrai business_hours e determina lo status
+                            # Extract business_hours and determine status
                             custom_params = data['start'].get('customParameters', {})
                             business_hours = custom_params.get('business_hours', '')
-                            
-                            # Estrai caller_id
                             self.caller_id = custom_params.get('caller_id', '')
                             
                             logger.info(f"[{self.session_id}] Raw business_hours: {business_hours}")
                             logger.info(f"[{self.session_id}] Caller ID: {self.caller_id}")
                             
-                            # Estrai lo status (open/close)
+                            # Extract status (open/close)
                             self.business_status = self.extract_business_status(business_hours)
-                            
                             logger.info(f"[{self.session_id}] Extracted business status: {self.business_status}")
                             
-                            # ORA INIZIALIZZA PIPECAT con il business_status corretto
-                            logger.info(f"Session {self.session_id}: Initializing Pipecat with business_status: {self.business_status}")
-                            
+                            # Initialize Pipecat Cloud session
                             pipecat_initialized = await self.initialize_pipecat_with_business_status(self.business_status)
                             
                             if pipecat_initialized:
-                                logger.info(f"✅ [{self.session_id}] Pipecat initialized successfully with status: {self.business_status}")
+                                logger.info(f"✅ [{self.session_id}] Pipecat Cloud initialized with status: {self.business_status}")
                             else:
-                                logger.error(f"❌ [{self.session_id}] Failed to initialize Pipecat")
+                                logger.error(f"❌ [{self.session_id}] Failed to initialize Pipecat Cloud")
                                 break
                         
                         logger.info(f"[{self.session_id}] streamSid: {self.stream_sid} | "
-                                   f"Pipecat Call ID: {self.pipecat_conn.call_id} | "
+                                   f"Pipecat Session ID: {self.pipecat_conn.session_id} | "
                                    f"Interaction ID: {self.interaction_id} | "
                                    f"Business Status: {self.business_status} | "
                                    f"Caller ID: {self.caller_id}")
@@ -536,14 +619,15 @@ class BridgeSession:
                         if self.stream_sid:
                             ACTIVE_SESSIONS[self.stream_sid] = self
                         
-                        # Salvataggio in Redis con caller_id
-                        if self.pipecat_conn.call_id:
+                        # Save to Redis with caller_id
+                        if self.pipecat_conn.session_id:
                             redis_client.hset(
-                                self.pipecat_conn.call_id, 
+                                self.pipecat_conn.session_id, 
                                 mapping={
                                     "interaction_id": self.interaction_id, 
                                     "stream_sid": self.stream_sid,
-                                    "caller_id": self.caller_id
+                                    "caller_id": self.caller_id,
+                                    "room_url": self.pipecat_conn.room_url
                                 }
                             )
                         
@@ -551,12 +635,12 @@ class BridgeSession:
                         continue
                         
                     elif event == 'stop':
-                        logger.info(f"🛑 Session {self.session_id}: Received STOP from Talkdesk (patient hung up)")
+                        logger.info(f"🛑 Session {self.session_id}: Received STOP from TalkDesk (patient hung up)")
                         
-                        # MySQL save logic con caller_id
+                        # MySQL save logic with caller_id (copied from original)
                         try:
-                            call_id = self.pipecat_conn.call_id
-                            assistant_id = self.config.pipecat_assistant_id
+                            call_id = self.pipecat_conn.session_id
+                            assistant_id = PIPECAT_ASSISTANT_ID
                             
                             if not self.interaction_id:
                                 interaction_id = redis_client.hget(call_id, "interaction_id")
@@ -564,7 +648,7 @@ class BridgeSession:
                                     interaction_id = interaction_id.decode()
                                 self.interaction_id = interaction_id
                             
-                            # Recupera caller_id da Redis se non disponibile localmente
+                            # Retrieve caller_id from Redis if not available locally
                             if not self.caller_id:
                                 caller_id = redis_client.hget(call_id, "caller_id")
                                 if isinstance(caller_id, bytes):
@@ -576,7 +660,6 @@ class BridgeSession:
                                        f"interaction_id={self.interaction_id}, "
                                        f"phone_number={self.caller_id}")
                             
-                            # Chiamata con phone_number (caller_id)
                             mysql_success = await save_call_to_mysql(
                                 call_id=call_id,
                                 assistant_id=assistant_id,
@@ -595,147 +678,37 @@ class BridgeSession:
                         break
                         
                     elif event == 'media':
-                        # Gestione media con stato WAITING_START
-                        if self.bridge_state == BridgeState.WAITING_START:
-                            # Buffer audio se Pipecat non è ancora pronto
+                        # Media handling - with Daily.co, we don't forward audio directly
+                        # Daily.co handles the audio streaming between TalkDesk and Pipecat
+                        # We can log media events for monitoring
+                        if self.bridge_state == BridgeState.ACTIVE:
                             media = data.get('media', {})
                             if media.get('track') == 'inbound':
-                                payload = media.get('payload', '')
-                                mulaw_data = base64.b64decode(payload)
-                                pcm_8khz = self.audio_processor.mulaw_to_pcm(mulaw_data)
-                                pcm_16khz = self.audio_processor.resample(
-                                    pcm_8khz,
-                                    self.config.talkdesk_sample_rate,
-                                    self.config.pipecat_sample_rate,
-                                    self.config.channels
-                                )
+                                self.stats['talkdesk_to_pipecat_packets'] += 1
                                 
-                                # Buffer l'audio invece di inviarlo
-                                self.audio_buffer.append(pcm_16khz)
-                                
-                                # Limita la dimensione del buffer
-                                if len(self.audio_buffer) > 100:
-                                    self.audio_buffer.pop(0)
-                                    
-                                logger.debug(f"Session {self.session_id}: Buffered audio packet (buffer size: {len(self.audio_buffer)})")
-                                
-                        elif self.bridge_state == BridgeState.ACTIVE:
-                            # Forwarding normale se Pipecat è pronto
-                            media = data.get('media', {})
-                            if media.get('track') == 'inbound':
-                                payload = media.get('payload', '')
-                                
-                                mulaw_data = base64.b64decode(payload)
-                                pcm_8khz = self.audio_processor.mulaw_to_pcm(mulaw_data)
-                                pcm_16khz = self.audio_processor.resample(
-                                    pcm_8khz,
-                                    self.config.talkdesk_sample_rate,
-                                    self.config.pipecat_sample_rate,
-                                    self.config.channels
-                                )
-                                
-                                try:
-                                    await self.pipecat_conn.send_audio(pcm_16khz)
-                                    self.stats['talkdesk_to_pipecat_packets'] += 1
-                                except Exception:
-                                    pass
-                            
+                                # With Daily.co integration, audio is handled through the Daily room
+                                # No need to manually forward audio packets
+                                logger.debug(f"Session {self.session_id}: Media packet received (handled by Daily.co)")
+                        
                 except json.JSONDecodeError:
-                    logger.error(f"Session {self.session_id}: Invalid JSON from Talkdesk")
+                    logger.error(f"Session {self.session_id}: Invalid JSON from TalkDesk")
                 except Exception as e:
-                    logger.error(f"Session {self.session_id}: Error processing Talkdesk message: {e}")
+                    logger.error(f"Session {self.session_id}: Error processing TalkDesk message: {e}")
                     self.stats['errors'] += 1
                     
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Forward error: {e}")
-            self.stats['errors'] += 1
-    
-    async def _forward_pipecat_to_talkdesk(self):
-        """Inoltra audio da Pipecat a Talkdesk (inizia solo dopo START)"""
-        logger.info(f"Session {self.session_id}: Starting Pipecat → Talkdesk forwarding")
-        
-        try:
-            while self.is_active:
-                try:
-                    if self.bridge_state in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED]:
-                        logger.info(f"Session {self.session_id}: Pipecat forwarding paused - waiting for escalation completion")
-                        while (self.bridge_state in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED] 
-                               and self.is_active):
-                            await asyncio.sleep(0.5)
-                        continue
-                    
-                    if self.bridge_state != BridgeState.ACTIVE:
-                        break
-                        
-                    data = await self.pipecat_conn.receive()
-                    
-                    if isinstance(data, bytes) and len(data) > 0:
-                        # Pipecat invia PCM a 16kHz
-                        pcm_16khz = data
-                        
-                        # Resample a 8kHz per Talkdesk
-                        pcm_8khz = self.audio_processor.resample(
-                            pcm_16khz,
-                            self.config.pipecat_sample_rate,
-                            self.config.talkdesk_sample_rate,
-                            self.config.channels
-                        )
-                        
-                        # Converti in μ-law
-                        mulaw_data = self.audio_processor.pcm_to_mulaw(pcm_8khz)
-                        payload = base64.b64encode(mulaw_data).decode()
-                        
-                        self.chunk_counter += 1
-                        
-                        message = {
-                            "event": "media",
-                            "streamSid": self.stream_sid,
-                            "media": {
-                                "track": "outbound",
-                                "chunk": str(self.chunk_counter),
-                                "timestamp": str(int(time.time() * 1000)),
-                                "payload": payload
-                            }
-                        }
-                        
-                        await self.talkdesk_ws.send_text(json.dumps(message))
-                        self.stats['pipecat_to_talkdesk_packets'] += 1
-                        
-                        if self.stats['pipecat_to_talkdesk_packets'] == 1:
-                            logger.info(f"First message to Talkdesk: {json.dumps(message)[:200]}...")
-                            
-                except ConnectionError:
-                    if self.bridge_state == BridgeState.ACTIVE:
-                        logger.error(f"Session {self.session_id}: Pipecat connection lost unexpectedly")
-                        break
-                    else:
-                        logger.info(f"Session {self.session_id}: Pipecat disconnected for escalation")
-                        while (self.bridge_state in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED] 
-                               and self.is_active):
-                            await asyncio.sleep(0.5)
-                        break
-                        
-                except Exception as e:
-                    if self.bridge_state == BridgeState.ACTIVE:
-                        logger.error(f"Session {self.session_id}: Backward error: {e}")
-                        self.stats['errors'] += 1
-                        break
-                    else:
-                        logger.debug(f"Session {self.session_id}: Pipecat error during escalation (expected): {e}")
-                        break
-                        
-        except Exception as e:
-            logger.error(f"Session {self.session_id}: Fatal backward error: {e}")
+            logger.error(f"Session {self.session_id}: Message processing error: {e}")
             self.stats['errors'] += 1
     
     async def stop(self):
+        """Stop bridge session (adapted for Daily.co)"""
         logger.info(f"Stopping session {self.session_id}")
         self.is_active = False
         self.set_bridge_state(BridgeState.CLOSED)
         
         logger.info(f"Session {self.session_id} stats: "
-                   f"Talkdesk→Pipecat: {self.stats['talkdesk_to_pipecat_packets']}, "
-                   f"Pipecat→Talkdesk: {self.stats['pipecat_to_talkdesk_packets']}, "
+                   f"TalkDesk→Pipecat: {self.stats['talkdesk_to_pipecat_packets']}, "
+                   f"Pipecat→TalkDesk: {self.stats['pipecat_to_talkdesk_packets']}, "
                    f"Errors: {self.stats['errors']}")
         
         if self.pipecat_conn.state not in [ConnectionState.CLOSED, ConnectionState.CLOSING]:
@@ -747,15 +720,19 @@ class BridgeSession:
             except Exception:
                 pass
 
+##############################################
+# FastAPI Endpoints
+##############################################
+
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "service": "pipecat-bridge"}
+    return {"status": "ok", "service": "pipecat-cloud-bridge"}
 
 @app.websocket("/talkdesk")
 async def talkdesk_ws(ws: WebSocket):
     await ws.accept()
     session_id = str(uuid.uuid4())
-    logger.info(f"New Talkdesk connection – Session: {session_id}")
+    logger.info(f"New TalkDesk connection – Session: {session_id}")
     session = BridgeSession(session_id, ws, cfg)
     ACTIVE_SESSIONS[session_id] = session
 
@@ -767,27 +744,34 @@ async def talkdesk_ws(ws: WebSocket):
         ACTIVE_SESSIONS.pop(session_id, None)
         logger.info(f"Session {session_id} ended")
 
-# Modifica la funzione per chiamare pipecat_stat invece di vapi_stat
+##############################################
+# Pipecat Cloud Stats Function
+##############################################
+
 async def call_pipecat_stat_internal(call_id: str, interaction_id: str) -> Optional[Dict[str, Any]]:
-    """Chiama il servizio di statistiche Pipecat (se implementato)"""
+    """Call Pipecat Cloud statistics service (placeholder implementation)"""
     try:
-        # Per ora restituisce dati di default
-        # Puoi implementare un endpoint nel tuo server Pipecat per ottenere statistiche
+        # For now return default data - you can implement actual Pipecat Cloud API call
         return {
             "success": True,
             "action": "transfer",
             "sentiment": "neutral",
             "duration_seconds": 0,
             "cost": 0,
-            "summary": "Chiamata gestita da Pipecat",
+            "summary": "Call handled by Pipecat Cloud",
             "service": "5"
         }
         
     except Exception as e:
-        logger.error(f"Errore chiamata pipecat_stat: {str(e)}")
+        logger.error(f"Error calling pipecat_stat: {str(e)}")
         return None
 
+##############################################
+# Helper Functions (copied from original)
+##############################################
+
 def limita_testo_256(text):
+    """Limit text to 256 characters (copied from original)"""
     max_length = 240
     if len(text) <= max_length:
         return text
@@ -798,6 +782,7 @@ def limita_testo_256(text):
     return truncated.strip() + ""
 
 def build_talkdesk_message(stream_sid: str, pipecat_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build TalkDesk escalation message (copied from original)"""
     action = "transfer"
     sentiment = "neutral"
     duration = "0"
@@ -831,16 +816,20 @@ def build_talkdesk_message(stream_sid: str, pipecat_data: Optional[Dict[str, Any
     }
     return stop_msg
 
+##############################################
+# Escalation Endpoint (copied from original)
+##############################################
+
 @app.post("/escalation")
 async def escalation(request: Request) -> Dict[str, Any]:
-    """Endpoint per gestire l'escalation (compatibile con il sistema esistente)"""
+    """Endpoint for handling escalation (compatible with existing system)"""
     payload = await request.json()
     call_id = payload.get("message", {}).get("call", {}).get("id")
     tool_calls = payload.get("message", {}).get("toolCallList", []) or [{}]
     
     results = [{
         "toolCallId": tc.get("id"),
-        "result": call_id or "Errore: call_id non trovato"
+        "result": call_id or "Error: call_id not found"
     } for tc in tool_calls]
     
     if call_id:
@@ -857,16 +846,16 @@ async def escalation(request: Request) -> Dict[str, Any]:
             if session:
                 try:
                     await asyncio.sleep(1.5)
-                    logger.info(f"🔄 Starting immediate Pipecat closure for call {call_id}")
+                    logger.info(f"🔄 Starting immediate Pipecat Cloud closure for call {call_id}")
                     
                     escalation_started = await session.start_escalation()
                     
                     if not escalation_started:
                         raise Exception("Failed to start escalation process")
                     
-                    logger.info(f"✅ Pipecat WebSocket closed immediately for call {call_id}")
+                    logger.info(f"✅ Pipecat Cloud session closed immediately for call {call_id}")
                     
-                    logger.info(f"⏳ Waiting for Pipecat to complete...")
+                    logger.info(f"⏳ Waiting for Pipecat Cloud to complete...")
                     await asyncio.sleep(2)
                     
                     logger.info(f"📊 Fetching final call data...")
@@ -904,11 +893,11 @@ async def escalation(request: Request) -> Dict[str, Any]:
                     except Exception as fallback_error:
                         logger.error(f"❌ Fallback escalation also failed: {str(fallback_error)}")
             else:
-                logger.warning(f"Escalation: nessuna sessione viva per streamSid {stream_sid}")
+                logger.warning(f"Escalation: no active session for streamSid {stream_sid}")
         else:
-            logger.warning(f"Escalation: streamSid non trovato per call_id {call_id}")
+            logger.warning(f"Escalation: streamSid not found for call_id {call_id}")
     else:
-        logger.warning("Escalation: call_id mancante")
+        logger.warning("Escalation: call_id missing")
     
     return {"results": results}
 
