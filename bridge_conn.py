@@ -28,8 +28,8 @@ ACTIVE_SESSIONS: Dict[str, "BridgeSession"] = {}
 ##############################################
 # Pipecat Cloud Configuration
 ##############################################
-PIPECAT_ORGANIZATION = os.getenv("PIPECAT_ORGANIZATION", "")  # Your org name from 'pcc organizations list'
-PIPECAT_AGENT_NAME = os.getenv("PIPECAT_AGENT_NAME", "voila-health-agent")  # Your agent name
+PIPECAT_ORGANIZATION = os.getenv("PIPECAT_ORGANIZATION", "imhtp-workspace")  # Your org name from 'pcc organizations list'
+PIPECAT_AGENT_NAME = os.getenv("PIPECAT_AGENT_NAME", "health-booking-assistant")  # Your agent name
 
 if not PIPECAT_ORGANIZATION:
     logging.error("PIPECAT_ORGANIZATION environment variable required!")
@@ -98,7 +98,7 @@ redis_client = redis.StrictRedis(
 ##############################################
 # Server Configuration
 ##############################################
-PORT = 8080
+PORT = 8000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -864,4 +864,6 @@ async def escalation(request: Request) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    import os
+    port = int(os.environ.get("PORT", 8000))  # Azure uses PORT env var
+    uvicorn.run(app, host="0.0.0.0", port=port)
