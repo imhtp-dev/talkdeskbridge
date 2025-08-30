@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Pipecat Cloud-Talkdesk Bridge Server - Daily.co Integration
-Integrates Pipecat Cloud agents with TalkDesk using Daily.co rooms
+Pipecat-Talkdesk Bridge Server - Twilio WebSocket Transport Integration
+Direct forwarding approach using Pipecat Cloud's Twilio WebSocket endpoint
 """
-
 import redis
 import asyncio
+import websockets
 import json
 import base64
 import audioop
@@ -20,15 +20,27 @@ import uuid
 import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import time
-from typing import Dict
-
 import aiohttp
 import aiomysql
 
 ACTIVE_SESSIONS: Dict[str, "BridgeSession"] = {}
 
 ##############################################
-# MySQL Configuration (copied from original)
+# Pipecat Cloud Configuration
+##############################################
+PIPECAT_ORGANIZATION = os.getenv("PIPECAT_ORGANIZATION", "")  # Your org name from 'pcc organizations list'
+PIPECAT_AGENT_NAME = os.getenv("PIPECAT_AGENT_NAME", "voila-health-agent")  # Your agent name
+
+if not PIPECAT_ORGANIZATION:
+    logging.error("PIPECAT_ORGANIZATION environment variable required!")
+    logging.error("Get it with: pcc organizations list")
+    sys.exit(1)
+
+# Pipecat Cloud Twilio WebSocket URL
+PIPECAT_WS_BASE_URL = "wss://api.pipecat.daily.co/ws/twilio"
+
+##############################################
+# MySQL Configuration (unchanged)
 ##############################################
 DB_CONFIG = {
     "host": "voikdbm74prodzj.mysql.database.azure.com",
@@ -43,21 +55,9 @@ DB_CONFIG = {
 }
 
 async def save_call_to_mysql(call_id: str, assistant_id: str, interaction_id: str, phone_number: str = "") -> bool:
-    """MySQL save function (copied from original)"""
     connection = None
     try:
-        connection = await aiomysql.connect(
-            host=DB_CONFIG["host"],
-            port=DB_CONFIG["port"],
-            user=DB_CONFIG["user"],
-            password=DB_CONFIG["password"],
-            db=DB_CONFIG["db"],
-            charset=DB_CONFIG["charset"],
-            autocommit=DB_CONFIG["autocommit"],
-            connect_timeout=DB_CONFIG["connect_timeout"],
-            ssl=DB_CONFIG["ssl"]
-        )
-        
+        connection = await aiomysql.connect(**DB_CONFIG)
         action = "completed"
         
         async with connection.cursor() as cursor:
@@ -65,39 +65,28 @@ async def save_call_to_mysql(call_id: str, assistant_id: str, interaction_id: st
             INSERT INTO tb_stat (assistant_id, interaction_id, call_id, action, phone_number) 
             VALUES (%s, %s, %s, %s, %s)
             """
-            
             await cursor.execute(query, (assistant_id, interaction_id, call_id, action, phone_number))
             
             if cursor.rowcount > 0:
-                logger.info(f"MySQL: Successfully saved call data - call_id: {call_id}, interaction_id: {interaction_id}, phone_number: {phone_number}")
+                logger.info(f"MySQL: Successfully saved call data - call_id: {call_id}")
                 return True
             else:
                 logger.warning(f"MySQL: No rows affected for call_id: {call_id}")
                 return False
                 
-    except aiomysql.Error as e:
-        logger.error(f"MySQL Error saving call {call_id}: {e}")
-        return False
     except Exception as e:
-        logger.error(f"Unexpected error saving call {call_id}: {e}")
+        logger.error(f"MySQL Error saving call {call_id}: {e}")
         return False
     finally:
         if connection:
             connection.close()
 
 ##############################################
-# Redis Configuration (copied from original)
+# Redis Configuration (unchanged)
 ##############################################
-PIPECAT_STAT_CONFIG = {
-    "base_url": "https://voilavoiceagent-cyf2e9bshnguaebh.westeurope-01.azurewebsites.net",
-    "endpoint": "/pipecat_stat",
-    "timeout": 30
-}
-
 HOST = 'VoilaVoice.redis.cache.windows.net'
 PORT = 6380
 PASSWORD = '8GhNRK1BsfL5D45MFHoFZpw5j7OkFpZ9BAzCaIp3TFY='
-ttl = 24 * 3600
 
 redis_client = redis.StrictRedis(
     host=HOST,
@@ -107,26 +96,9 @@ redis_client = redis.StrictRedis(
 )
 
 ##############################################
-# Pipecat Cloud Configuration
+# Server Configuration
 ##############################################
 PORT = 8080
-
-# Pipecat Cloud settings
-PIPECAT_CLOUD_CONFIG = {
-    "base_url": "https://api.pipecat.daily.co/v1",  # Base API URL
-    "agent_name": "health-booking-assistant",  # Your deployed agent name
-    "api_key": os.getenv("PIPECAT_CLOUD_API_KEY"),  # Add your API key to environment
-    "timeout": 30
-}
-
-# Daily.co configuration
-DAILY_CONFIG = {
-    "api_key": os.getenv("DAILY_API_KEY"),  # Add your Daily API key to environment
-    "base_url": "https://api.daily.co/v1",
-    "timeout": 30
-}
-
-PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,7 +108,7 @@ logging.basicConfig(
         logging.FileHandler('bridge.log')
     ]
 )
-logger = logging.getLogger('PipecatCloudBridge')
+logger = logging.getLogger('PipecatTwilioBridge')
 
 class ConnectionState(Enum):
     INIT = "init"
@@ -154,263 +126,134 @@ class BridgeState(Enum):
     CLOSING = "closing"
     CLOSED = "closed"
 
-@dataclass
-class BridgeConfig:
-    host: str = "0.0.0.0"
-    port: int = PORT
-    pipecat_cloud_config: Dict[str, Any] = None
-    daily_config: Dict[str, Any] = None
-    talkdesk_sample_rate: int = 8000
-    pipecat_sample_rate: int = 16000
-    channels: int = 1
-    chunk_size: int = 160
-
-cfg = BridgeConfig(
-    pipecat_cloud_config=PIPECAT_CLOUD_CONFIG,
-    daily_config=DAILY_CONFIG
-)
-app = FastAPI()
-
-class AudioProcessor:
-    """Audio processing utilities (copied from original)"""
-    @staticmethod
-    def mulaw_to_pcm(mulaw_data: bytes) -> bytes:
-        try:
-            return audioop.ulaw2lin(mulaw_data, 2)
-        except Exception as e:
-            logger.error(f"Error converting μ-law → PCM: {e}")
-            return b''
+class PipecatTwilioConnection:
+    """Manages connection to Pipecat Cloud via Twilio WebSocket protocol"""
     
-    @staticmethod
-    def pcm_to_mulaw(pcm_data: bytes) -> bytes:
-        try:
-            return audioop.lin2ulaw(pcm_data, 2)
-        except Exception as e:
-            logger.error(f"Error converting PCM → μ-law: {e}")
-            return b''
-    
-    @staticmethod
-    def resample(audio_data: bytes, from_rate: int, to_rate: int, 
-                 channels: int = 1, sample_width: int = 2) -> bytes:
-        try:
-            if from_rate == to_rate:
-                return audio_data
-                
-            resampled, _ = audioop.ratecv(
-                audio_data,
-                sample_width,
-                channels,
-                from_rate,
-                to_rate,
-                None
-            )
-            return resampled
-        except Exception as e:
-            logger.error(f"Error resampling {from_rate}Hz → {to_rate}Hz: {e}")
-            return audio_data
-
-class DailyRoomManager:
-    """Manages Daily.co room creation and token generation"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.session = aiohttp.ClientSession()
-    
-    async def create_room(self, room_name: Optional[str] = None) -> Dict[str, Any]:
-        """Create a Daily.co room for the Pipecat session"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.config['api_key']}",
-                "Content-Type": "application/json"
-            }
-            
-            room_config = {
-                "privacy": "private",
-                "properties": {
-                    "start_audio_off": False,
-                    "start_video_off": True,
-                    "enable_chat": False,
-                    "enable_knocking": False,
-                    "enable_screenshare": False,
-                    "enable_recording": "local",
-                    "exp": int(time.time()) + 3600  # 1 hour expiration
-                }
-            }
-            
-            if room_name:
-                room_config["name"] = room_name
-                
-            async with self.session.post(
-                f"{self.config['base_url']}/rooms",
-                headers=headers,
-                json=room_config,
-                timeout=self.config['timeout']
-            ) as response:
-                if response.status == 200:
-                    room_data = await response.json()
-                    logger.info(f"Created Daily room: {room_data['name']}")
-                    return room_data
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Failed to create Daily room: {response.status} - {error_text}")
-                    
-        except Exception as e:
-            logger.error(f"Daily room creation error: {e}")
-            raise
-    
-    async def create_token(self, room_name: str, is_owner: bool = False) -> str:
-        """Create a meeting token for the Daily room"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.config['api_key']}",
-                "Content-Type": "application/json"
-            }
-            
-            token_config = {
-                "properties": {
-                    "room_name": room_name,
-                    "is_owner": is_owner,
-                    "exp": int(time.time()) + 3600,  # 1 hour expiration
-                    "enable_recording": True
-                }
-            }
-            
-            async with self.session.post(
-                f"{self.config['base_url']}/meeting-tokens",
-                headers=headers,
-                json=token_config,
-                timeout=self.config['timeout']
-            ) as response:
-                if response.status == 200:
-                    token_data = await response.json()
-                    return token_data['token']
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Failed to create token: {response.status} - {error_text}")
-                    
-        except Exception as e:
-            logger.error(f"Daily token creation error: {e}")
-            raise
-    
-    async def close(self):
-        """Close the HTTP session"""
-        if self.session:
-            await self.session.close()
-
-class PipecatCloudConnection:
-    """Manages connection to Pipecat Cloud agent through Daily.co rooms"""
-    
-    def __init__(self, config: BridgeConfig):
-        self.config = config
-        self.daily_manager = DailyRoomManager(config.daily_config)
-        self.session_id: Optional[str] = None
-        self.room_url: Optional[str] = None
-        self.room_name: Optional[str] = None
-        self.token: Optional[str] = None
+    def __init__(self):
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.call_id: Optional[str] = None
         self.state = ConnectionState.INIT
-        self.session_data: Dict[str, Any] = {}
-        self.http_session = aiohttp.ClientSession()
+        self.sequence_number = 0
         
-    async def create_pipecat_session(self, business_status: str = "close") -> Dict[str, Any]:
-        """Create a new Pipecat Cloud session with Daily.co integration"""
+    def get_next_sequence_number(self) -> str:
+        """Get next sequence number for Twilio protocol"""
+        self.sequence_number += 1
+        return str(self.sequence_number)
+        
+    async def create_connection(self, business_status: str = "close") -> Dict[str, Any]:
+        """Create Pipecat Cloud WebSocket URL with service host parameter"""
         try:
             self.state = ConnectionState.CONNECTING
+            self.call_id = str(uuid.uuid4())
             
-            # Generate unique session ID
-            self.session_id = str(uuid.uuid4())
+            # Build Pipecat Cloud Twilio WebSocket URL with service host parameter
+            service_host = f"{PIPECAT_AGENT_NAME}.{PIPECAT_ORGANIZATION}"
+            pipecat_ws_url = f"{PIPECAT_WS_BASE_URL}?_pipecatCloudServiceHost={service_host}"
             
-            # Create Daily.co room
-            room_name = f"pipecat-session-{self.session_id[:8]}"
-            room_data = await self.daily_manager.create_room(room_name)
-            self.room_url = room_data["url"]
-            self.room_name = room_data["name"]
+            logger.info(f"Creating Pipecat Twilio WebSocket connection")
+            logger.info(f"Service Host: {service_host}")
+            logger.info(f"WebSocket URL: {pipecat_ws_url}")
             
-            # Create meeting token
-            self.token = await self.daily_manager.create_token(self.room_name, is_owner=False)
-            
-            # Start Pipecat Cloud session
-            await self._start_pipecat_agent_session(business_status)
-            
-            self.state = ConnectionState.CONNECTED
-            
-            # Save session data
-            self.session_data = {
-                'id': self.session_id,
-                'room_url': self.room_url,
-                'room_name': self.room_name,
-                'token': self.token,
+            session_data = {
+                'id': self.call_id,
                 'business_status': business_status,
+                'service_host': service_host,
+                'ws_url': pipecat_ws_url,
                 'created_at': time.time()
             }
             
-            logger.info(f"Pipecat Cloud session created: {self.session_id}")
-            logger.info(f"Daily room: {self.room_url}")
-            
-            return self.session_data
+            return session_data
             
         except Exception as e:
             self.state = ConnectionState.ERROR
-            logger.error(f"Failed to create Pipecat Cloud session: {e}")
+            logger.error(f"Failed to create Pipecat connection: {e}")
             raise
     
-    async def _start_pipecat_agent_session(self, business_status: str):
-        """Start the Pipecat Cloud agent session via REST API"""
+    async def connect(self, ws_url: str):
+        """Connect to Pipecat Cloud Twilio WebSocket"""
         try:
-            headers = {
-                "Authorization": f"Bearer {self.config.pipecat_cloud_config['api_key']}",
-                "Content-Type": "application/json"
+            logger.info(f"Connecting to Pipecat Twilio WebSocket: {ws_url}")
+            
+            self.websocket = await websockets.connect(
+                ws_url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=10
+            )
+            
+            self.state = ConnectionState.CONNECTED
+            logger.info(f"Connected to Pipecat Twilio WebSocket: {self.call_id}")
+            
+            # Send initial connected message (Twilio protocol)
+            connected_msg = {
+                "event": "connected",
+                "protocol": "Call",
+                "version": "1.0.0"
             }
+            await self.websocket.send(json.dumps(connected_msg))
+            logger.info("Sent connected message to Pipecat")
             
-            # Session start payload for Pipecat Cloud
-            start_payload = {
-                "config": {
-                    "room_url": self.room_url,
-                    "token": self.token,
-                    "business_status": business_status,
-                    "session_id": self.session_id
-                }
-            }
-            
-            agent_name = self.config.pipecat_cloud_config['agent_name']
-            start_url = f"{self.config.pipecat_cloud_config['base_url']}/{agent_name}/start"
-            
-            async with self.http_session.post(
-                start_url,
-                headers=headers,
-                json=start_payload,
-                timeout=self.config.pipecat_cloud_config['timeout']
-            ) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    logger.info(f"Pipecat agent session started: {result}")
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Failed to start Pipecat agent: {response.status} - {error_text}")
-                    
         except Exception as e:
-            logger.error(f"Pipecat agent session start error: {e}")
+            self.state = ConnectionState.ERROR
+            logger.error(f"Failed to connect to Pipecat Twilio WebSocket: {e}")
             raise
+    
+    async def send_twilio_message(self, message: Dict[str, Any]):
+        """Send Twilio-formatted message to Pipecat"""
+        if self.websocket and self.state == ConnectionState.CONNECTED:
+            try:
+                # Add sequence number if not present
+                if "sequenceNumber" not in message and message.get("event") in ["start", "media", "stop"]:
+                    message["sequenceNumber"] = self.get_next_sequence_number()
+                
+                await self.websocket.send(json.dumps(message))
+                logger.debug(f"Sent to Pipecat: {message.get('event', 'unknown')}")
+                
+            except Exception as e:
+                logger.error(f"Error sending message to Pipecat: {e}")
+                self.state = ConnectionState.ERROR
+                raise
+    
+    async def receive_twilio_message(self) -> Optional[Dict[str, Any]]:
+        """Receive Twilio-formatted message from Pipecat"""
+        if self.websocket and self.state == ConnectionState.CONNECTED:
+            try:
+                data = await self.websocket.recv()
+                if isinstance(data, str):
+                    message = json.loads(data)
+                    logger.debug(f"Received from Pipecat: {message.get('event', 'unknown')}")
+                    return message
+                else:
+                    # Handle binary data if needed
+                    return None
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("Pipecat WebSocket connection closed")
+                self.state = ConnectionState.CLOSED
+                return None
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON from Pipecat")
+                return None
+            except Exception as e:
+                logger.error(f"Error receiving from Pipecat: {e}")
+                raise
+        return None
     
     async def close(self):
-        """Close the Pipecat Cloud session"""
+        """Close Pipecat connection"""
         self.state = ConnectionState.CLOSING
-        try:
-            await self.daily_manager.close()
-            await self.http_session.close()
-            logger.info(f"Pipecat Cloud session closed: {self.session_id}")
-        except Exception as e:
-            logger.error(f"Error closing Pipecat Cloud session: {e}")
+        if self.websocket:
+            try:
+                await self.websocket.close()
+                logger.info(f"Pipecat Twilio WebSocket closed: {self.call_id}")
+            except Exception as e:
+                logger.error(f"Error closing Pipecat connection: {e}")
         self.state = ConnectionState.CLOSED
 
 class BridgeSession:
-    """Bridge session managing TalkDesk to Pipecat Cloud integration"""
-    
-    def __init__(self, session_id: str, talkdesk_ws: WebSocket, config: BridgeConfig):
+    def __init__(self, session_id: str, talkdesk_ws: WebSocket):
         self.session_id = session_id
         self.talkdesk_ws = talkdesk_ws
-        self.config = config
-        self.pipecat_conn = PipecatCloudConnection(config)
-        self.audio_processor = AudioProcessor()
+        self.pipecat_conn = PipecatTwilioConnection()
         self.is_active = False
         self.tasks: Set[asyncio.Task] = set()
         
@@ -418,22 +261,22 @@ class BridgeSession:
         self.escalation_event = asyncio.Event()
         
         self.stream_sid = None
-        self.chunk_counter = 0
         self.interaction_id = None
         self.caller_id = None
         self.business_status = None
+        self.pipecat_ws_url = None
         
-        # Buffer for messages received before Pipecat is ready
-        self.audio_buffer = []
+        # Message buffer for before Pipecat is ready
+        self.message_buffer = []
         
         self.stats = {
-            'talkdesk_to_pipecat_packets': 0,
-            'pipecat_to_talkdesk_packets': 0,
+            'talkdesk_to_pipecat_messages': 0,
+            'pipecat_to_talkdesk_messages': 0,
             'errors': 0
         }
     
     def extract_business_status(self, business_hours_string: str) -> str:
-        """Extract status (open/close) from business_hours string (copied from original)"""
+        """Extract status from business_hours string"""
         try:
             if business_hours_string and '::' in business_hours_string:
                 parts = business_hours_string.split('::')
@@ -442,81 +285,175 @@ class BridgeSession:
                     logger.info(f"Session {self.session_id}: Extracted business status: {status}")
                     return status
             
-            logger.warning(f"Session {self.session_id}: Could not extract business status from: {business_hours_string}")
+            logger.warning(f"Session {self.session_id}: Could not extract business status")
             return "close"
             
         except Exception as e:
             logger.error(f"Session {self.session_id}: Error extracting business status: {e}")
             return "close"
     
-    async def initialize_pipecat_with_business_status(self, business_status: str):
-        """Initialize Pipecat Cloud session with business status"""
-        try:
-            logger.info(f"Session {self.session_id}: Initializing Pipecat Cloud with business_status: {business_status}")
+    def talkdesk_to_twilio_format(self, talkdesk_msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert Talkdesk message format to Twilio format"""
+        event = talkdesk_msg.get('event')
+        
+        if event == 'start':
+            # Convert Talkdesk start to Twilio start
+            twilio_msg = {
+                "event": "start",
+                "start": {
+                    "accountSid": f"AC{self.session_id[:30]}",  # Fake account SID
+                    "callSid": f"CA{self.pipecat_conn.call_id[:30]}",  # Fake call SID  
+                    "streamSid": talkdesk_msg.get('streamSid', ''),
+                    "tracks": ["inbound", "outbound"],
+                    "mediaFormat": {
+                        "encoding": "audio/x-mulaw",
+                        "sampleRate": 8000,
+                        "channels": 1
+                    }
+                }
+            }
             
-            # Create Pipecat Cloud session with Daily.co integration
-            await self.pipecat_conn.create_pipecat_session(business_status)
+            # Add custom parameters from Talkdesk
+            if 'start' in talkdesk_msg and 'customParameters' in talkdesk_msg['start']:
+                custom_params = talkdesk_msg['start']['customParameters']
+                # Add business_status to custom parameters
+                custom_params['business_status'] = self.business_status
+                twilio_msg['start']['customParameters'] = custom_params
+            
+            return twilio_msg
+            
+        elif event == 'media':
+            # Media messages are already very similar
+            twilio_msg = {
+                "event": "media",
+                "streamSid": talkdesk_msg.get('streamSid', ''),
+                "media": talkdesk_msg.get('media', {})
+            }
+            return twilio_msg
+            
+        elif event == 'stop':
+            # Stop messages are simple
+            twilio_msg = {
+                "event": "stop", 
+                "streamSid": talkdesk_msg.get('streamSid', '')
+            }
+            return twilio_msg
+        
+        else:
+            # Pass through other messages as-is
+            return talkdesk_msg
+    
+    def twilio_to_talkdesk_format(self, twilio_msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert Twilio message format back to Talkdesk format"""
+        event = twilio_msg.get('event')
+        
+        if event == 'media':
+            # Convert Twilio media back to Talkdesk format
+            talkdesk_msg = {
+                "event": "media",
+                "streamSid": self.stream_sid,  # Use original Talkdesk stream SID
+                "media": twilio_msg.get('media', {})
+            }
+            
+            # Ensure we have the required fields for Talkdesk
+            if 'media' in talkdesk_msg:
+                media = talkdesk_msg['media']
+                if 'chunk' not in media:
+                    media['chunk'] = str(int(time.time()))
+                if 'timestamp' not in media:
+                    media['timestamp'] = str(int(time.time() * 1000))
+                    
+            return talkdesk_msg
+        
+        else:
+            # For other events, pass through or ignore
+            return twilio_msg
+    
+    async def initialize_pipecat_with_business_status(self, business_status: str):
+        """Initialize Pipecat Twilio WebSocket with business_status"""
+        try:
+            logger.info(f"Session {self.session_id}: Initializing Pipecat Twilio WebSocket")
+            logger.info(f"Business Status: {business_status}")
+            
+            # Create Pipecat connection
+            session_data = await self.pipecat_conn.create_connection(business_status)
+            self.pipecat_ws_url = session_data['ws_url']
+            
+            # Connect to Pipecat Twilio WebSocket
+            await self.pipecat_conn.connect(self.pipecat_ws_url)
             
             # Change state to ACTIVE
             self.set_bridge_state(BridgeState.ACTIVE)
             
-            logger.info(f"Session {self.session_id}: Pipecat Cloud initialized successfully with business_status: {business_status}")
+            logger.info(f"Session {self.session_id}: Pipecat Twilio WebSocket initialized successfully")
             
-            # Note: Audio forwarding will be handled differently with Daily.co
-            # We don't send buffered audio directly - Daily.co handles the media streaming
+            # Send buffered messages
+            if self.message_buffer:
+                logger.info(f"Session {self.session_id}: Sending {len(self.message_buffer)} buffered messages")
+                for msg in self.message_buffer:
+                    try:
+                        twilio_msg = self.talkdesk_to_twilio_format(msg)
+                        await self.pipecat_conn.send_twilio_message(twilio_msg)
+                        self.stats['talkdesk_to_pipecat_messages'] += 1
+                    except Exception as e:
+                        logger.error(f"Session {self.session_id}: Error sending buffered message: {e}")
+                        break
+                self.message_buffer.clear()
             
             return True
             
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Failed to initialize Pipecat Cloud: {e}")
+            logger.error(f"Session {self.session_id}: Failed to initialize Pipecat: {e}")
             self.set_bridge_state(BridgeState.ERROR)
             return False
     
     def set_bridge_state(self, new_state: BridgeState):
-        """Set bridge state with logging (copied from original)"""
         old_state = self.bridge_state
         self.bridge_state = new_state
         logger.info(f"Session {self.session_id}: Bridge state changed {old_state.value} → {new_state.value}")
     
     async def start_escalation(self) -> bool:
-        """Start escalation process (adapted for Daily.co)"""
         try:
             if self.bridge_state != BridgeState.ACTIVE:
-                logger.warning(f"Session {self.session_id}: Cannot start escalation, state is {self.bridge_state.value}")
+                logger.warning(f"Session {self.session_id}: Cannot start escalation")
                 return False
             
             logger.info(f"Session {self.session_id}: Starting escalation process")
             self.set_bridge_state(BridgeState.ESCALATING)
             
+            # Send stop message to Pipecat
+            stop_msg = {
+                "event": "stop",
+                "streamSid": self.stream_sid
+            }
+            twilio_stop = self.talkdesk_to_twilio_format(stop_msg)
+            await self.pipecat_conn.send_twilio_message(twilio_stop)
+            
+            # Close Pipecat connection
             await self.pipecat_conn.close()
-            logger.info(f"Session {self.session_id}: Pipecat Cloud session closed for escalation")
+            
+            logger.info(f"Session {self.session_id}: Pipecat connection closed for escalation")
             
             self.escalation_event.set()
             await asyncio.sleep(2)
             
             self.set_bridge_state(BridgeState.PIPECAT_CLOSED)
-            logger.info(f"Session {self.session_id}: Escalation ready - Pipecat session completed")
+            logger.info(f"Session {self.session_id}: Escalation ready")
             
             return True
             
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Error during escalation start: {e}")
+            logger.error(f"Session {self.session_id}: Error during escalation: {e}")
             return False
     
     async def complete_escalation(self, stop_msg: Dict[str, Any]) -> bool:
-        """Complete escalation process (copied from original)"""
         try:
-            if self.bridge_state not in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED]:
-                logger.warning(f"Session {self.session_id}: Cannot complete escalation, state is {self.bridge_state.value}")
-                return False
-            
             logger.info(f"Session {self.session_id}: Completing escalation")
             
             await self.talkdesk_ws.send_text(json.dumps(stop_msg))
             logger.info(f"Session {self.session_id}: Escalation message sent to Talkdesk")
             
             self.set_bridge_state(BridgeState.CLOSING)
-            
             return True
             
         except Exception as e:
@@ -524,18 +461,26 @@ class BridgeSession:
             return False
     
     async def start(self):
-        """Start bridge session with Daily.co integration"""
+        """Start the bridge session"""
         try:
-            logger.info(f"Starting bridge session: {self.session_id}")
+            logger.info(f"Starting Twilio bridge session: {self.session_id}")
             
             self.is_active = True
             self.set_bridge_state(BridgeState.WAITING_START)
             
-            # Start TalkDesk message processing
-            forward_task = asyncio.create_task(self._process_talkdesk_messages())
+            # Start message forwarding tasks
+            forward_task = asyncio.create_task(self._forward_talkdesk_to_pipecat())
+            backward_task = None
+            
             self.tasks = {forward_task}
             
             while self.is_active and self.bridge_state not in [BridgeState.CLOSING, BridgeState.CLOSED]:
+                # After Pipecat is initialized, add backward task
+                if self.bridge_state == BridgeState.ACTIVE and backward_task is None:
+                    backward_task = asyncio.create_task(self._forward_pipecat_to_talkdesk())
+                    self.tasks.add(backward_task)
+                    logger.info(f"Session {self.session_id}: Started Pipecat → Talkdesk forwarding")
+                
                 done, pending = await asyncio.wait(
                     self.tasks, 
                     return_when=asyncio.FIRST_COMPLETED,
@@ -549,7 +494,7 @@ class BridgeSession:
                     continue
                 
                 if done and self.bridge_state == BridgeState.ACTIVE:
-                    logger.info(f"Session {self.session_id}: Normal termination - task completed")
+                    logger.info(f"Session {self.session_id}: Normal termination")
                     break
                     
             for task in self.tasks:
@@ -562,9 +507,9 @@ class BridgeSession:
         finally:
             await self.stop()
     
-    async def _process_talkdesk_messages(self):
-        """Process TalkDesk messages with Daily.co integration"""
-        logger.info(f"Session {self.session_id}: Starting TalkDesk message processing")
+    async def _forward_talkdesk_to_pipecat(self):
+        """Forward messages from Talkdesk to Pipecat (Twilio format)"""
+        logger.info(f"Session {self.session_id}: Starting Talkdesk → Pipecat forwarding")
         
         try:
             while self.is_active:
@@ -579,7 +524,7 @@ class BridgeSession:
                     event = data.get('event')
                     
                     if event == 'start':
-                        logger.info(f"Session {self.session_id}: Received START from TalkDesk")
+                        logger.info(f"Session {self.session_id}: Received START from Talkdesk")
                         
                         # Extract session data
                         self.stream_sid = data.get('streamSid')
@@ -589,76 +534,52 @@ class BridgeSession:
                         if 'start' in data:
                             self.interaction_id = data['start'].get('customParameters', {}).get('interaction_id')
                             
-                            # Extract business_hours and determine status
                             custom_params = data['start'].get('customParameters', {})
                             business_hours = custom_params.get('business_hours', '')
                             self.caller_id = custom_params.get('caller_id', '')
                             
-                            logger.info(f"[{self.session_id}] Raw business_hours: {business_hours}")
+                            logger.info(f"[{self.session_id}] Business hours: {business_hours}")
                             logger.info(f"[{self.session_id}] Caller ID: {self.caller_id}")
                             
-                            # Extract status (open/close)
+                            # Extract business status
                             self.business_status = self.extract_business_status(business_hours)
-                            logger.info(f"[{self.session_id}] Extracted business status: {self.business_status}")
                             
-                            # Initialize Pipecat Cloud session
+                            # Initialize Pipecat Twilio WebSocket
                             pipecat_initialized = await self.initialize_pipecat_with_business_status(self.business_status)
                             
-                            if pipecat_initialized:
-                                logger.info(f"✅ [{self.session_id}] Pipecat Cloud initialized with status: {self.business_status}")
-                            else:
-                                logger.error(f"❌ [{self.session_id}] Failed to initialize Pipecat Cloud")
+                            if not pipecat_initialized:
+                                logger.error(f"Failed to initialize Pipecat for session {self.session_id}")
                                 break
                         
-                        logger.info(f"[{self.session_id}] streamSid: {self.stream_sid} | "
-                                   f"Pipecat Session ID: {self.pipecat_conn.session_id} | "
-                                   f"Interaction ID: {self.interaction_id} | "
-                                   f"Business Status: {self.business_status} | "
-                                   f"Caller ID: {self.caller_id}")
-                        
+                        # Store session data
                         if self.stream_sid:
                             ACTIVE_SESSIONS[self.stream_sid] = self
                         
-                        # Save to Redis with caller_id
-                        if self.pipecat_conn.session_id:
+                        # Save to Redis
+                        if self.pipecat_conn.call_id:
                             redis_client.hset(
-                                self.pipecat_conn.session_id, 
+                                self.pipecat_conn.call_id, 
                                 mapping={
                                     "interaction_id": self.interaction_id, 
                                     "stream_sid": self.stream_sid,
-                                    "caller_id": self.caller_id,
-                                    "room_url": self.pipecat_conn.room_url
+                                    "caller_id": self.caller_id
                                 }
                             )
                         
-                        logger.info(f"Session {self.session_id}: START processing completed with caller_id: {self.caller_id}")
+                        # Convert and send to Pipecat
+                        twilio_msg = self.talkdesk_to_twilio_format(data)
+                        await self.pipecat_conn.send_twilio_message(twilio_msg)
+                        self.stats['talkdesk_to_pipecat_messages'] += 1
+                        
                         continue
                         
                     elif event == 'stop':
-                        logger.info(f"🛑 Session {self.session_id}: Received STOP from TalkDesk (patient hung up)")
+                        logger.info(f"Session {self.session_id}: Received STOP from Talkdesk")
                         
-                        # MySQL save logic with caller_id (copied from original)
+                        # Save to MySQL
                         try:
-                            call_id = self.pipecat_conn.session_id
-                            assistant_id = PIPECAT_ASSISTANT_ID
-                            
-                            if not self.interaction_id:
-                                interaction_id = redis_client.hget(call_id, "interaction_id")
-                                if isinstance(interaction_id, bytes):
-                                    interaction_id = interaction_id.decode()
-                                self.interaction_id = interaction_id
-                            
-                            # Retrieve caller_id from Redis if not available locally
-                            if not self.caller_id:
-                                caller_id = redis_client.hget(call_id, "caller_id")
-                                if isinstance(caller_id, bytes):
-                                    caller_id = caller_id.decode()
-                                self.caller_id = caller_id or ""
-                            
-                            logger.info(f"💾 Saving to MySQL: call_id={call_id}, "
-                                       f"assistant_id={assistant_id}, "
-                                       f"interaction_id={self.interaction_id}, "
-                                       f"phone_number={self.caller_id}")
+                            call_id = self.pipecat_conn.call_id
+                            assistant_id = PIPECAT_AGENT_NAME
                             
                             mysql_success = await save_call_to_mysql(
                                 call_id=call_id,
@@ -668,52 +589,115 @@ class BridgeSession:
                             )
                             
                             if mysql_success:
-                                logger.info(f"✅ MySQL save successful for call {call_id} with phone_number {self.caller_id}")
+                                logger.info(f"MySQL save successful for call {call_id}")
                             else:
-                                logger.error(f"❌ MySQL save failed for call {call_id}")
+                                logger.error(f"MySQL save failed for call {call_id}")
                                 
                         except Exception as mysql_error:
-                            logger.error(f"❌ MySQL save error: {str(mysql_error)}")
+                            logger.error(f"MySQL save error: {str(mysql_error)}")
+                        
+                        # Send stop to Pipecat
+                        twilio_msg = self.talkdesk_to_twilio_format(data)
+                        await self.pipecat_conn.send_twilio_message(twilio_msg)
                         
                         break
                         
                     elif event == 'media':
-                        # Media handling - with Daily.co, we don't forward audio directly
-                        # Daily.co handles the audio streaming between TalkDesk and Pipecat
-                        # We can log media events for monitoring
-                        if self.bridge_state == BridgeState.ACTIVE:
-                            media = data.get('media', {})
-                            if media.get('track') == 'inbound':
-                                self.stats['talkdesk_to_pipecat_packets'] += 1
+                        # Handle media messages
+                        if self.bridge_state == BridgeState.WAITING_START:
+                            # Buffer messages until Pipecat is ready
+                            self.message_buffer.append(data)
+                            if len(self.message_buffer) > 100:
+                                self.message_buffer.pop(0)
+                            logger.debug(f"Session {self.session_id}: Buffered message (buffer size: {len(self.message_buffer)})")
                                 
-                                # With Daily.co integration, audio is handled through the Daily room
-                                # No need to manually forward audio packets
-                                logger.debug(f"Session {self.session_id}: Media packet received (handled by Daily.co)")
-                        
+                        elif self.bridge_state == BridgeState.ACTIVE:
+                            # Forward to Pipecat
+                            twilio_msg = self.talkdesk_to_twilio_format(data)
+                            await self.pipecat_conn.send_twilio_message(twilio_msg)
+                            self.stats['talkdesk_to_pipecat_messages'] += 1
+                    
+                    else:
+                        # Handle other message types
+                        if self.bridge_state == BridgeState.ACTIVE:
+                            twilio_msg = self.talkdesk_to_twilio_format(data)
+                            await self.pipecat_conn.send_twilio_message(twilio_msg)
+                            
                 except json.JSONDecodeError:
-                    logger.error(f"Session {self.session_id}: Invalid JSON from TalkDesk")
+                    logger.error(f"Session {self.session_id}: Invalid JSON from Talkdesk")
                 except Exception as e:
-                    logger.error(f"Session {self.session_id}: Error processing TalkDesk message: {e}")
+                    logger.error(f"Session {self.session_id}: Error processing Talkdesk message: {e}")
                     self.stats['errors'] += 1
                     
         except Exception as e:
-            logger.error(f"Session {self.session_id}: Message processing error: {e}")
+            logger.error(f"Session {self.session_id}: Forward error: {e}")
+            self.stats['errors'] += 1
+    
+    async def _forward_pipecat_to_talkdesk(self):
+        """Forward messages from Pipecat to Talkdesk"""
+        logger.info(f"Session {self.session_id}: Starting Pipecat → Talkdesk forwarding")
+        
+        try:
+            while self.is_active:
+                try:
+                    if self.bridge_state in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED]:
+                        logger.info(f"Session {self.session_id}: Pipecat forwarding paused")
+                        while (self.bridge_state in [BridgeState.ESCALATING, BridgeState.PIPECAT_CLOSED] 
+                               and self.is_active):
+                            await asyncio.sleep(0.5)
+                        continue
+                    
+                    if self.bridge_state != BridgeState.ACTIVE:
+                        break
+                        
+                    # Receive message from Pipecat
+                    pipecat_msg = await self.pipecat_conn.receive_twilio_message()
+                    
+                    if pipecat_msg is None:
+                        # Connection closed or no message
+                        continue
+                        
+                    # Convert Twilio format back to Talkdesk format and send
+                    if pipecat_msg.get('event') == 'media':
+                        talkdesk_msg = self.twilio_to_talkdesk_format(pipecat_msg)
+                        await self.talkdesk_ws.send_text(json.dumps(talkdesk_msg))
+                        self.stats['pipecat_to_talkdesk_messages'] += 1
+                        
+                        if self.stats['pipecat_to_talkdesk_messages'] == 1:
+                            logger.info(f"First message from Pipecat to Talkdesk")
+                    
+                    # Handle other message types from Pipecat if needed
+                    elif pipecat_msg.get('event') in ['mark', 'stop']:
+                        logger.debug(f"Received {pipecat_msg.get('event')} from Pipecat")
+                        
+                except Exception as e:
+                    if self.bridge_state == BridgeState.ACTIVE:
+                        logger.error(f"Session {self.session_id}: Backward error: {e}")
+                        self.stats['errors'] += 1
+                        break
+                    else:
+                        logger.debug(f"Session {self.session_id}: Pipecat error during escalation: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: Fatal backward error: {e}")
             self.stats['errors'] += 1
     
     async def stop(self):
-        """Stop bridge session (adapted for Daily.co)"""
         logger.info(f"Stopping session {self.session_id}")
         self.is_active = False
         self.set_bridge_state(BridgeState.CLOSED)
         
         logger.info(f"Session {self.session_id} stats: "
-                   f"TalkDesk→Pipecat: {self.stats['talkdesk_to_pipecat_packets']}, "
-                   f"Pipecat→TalkDesk: {self.stats['pipecat_to_talkdesk_packets']}, "
+                   f"Talkdesk→Pipecat: {self.stats['talkdesk_to_pipecat_messages']}, "
+                   f"Pipecat→Talkdesk: {self.stats['pipecat_to_talkdesk_messages']}, "
                    f"Errors: {self.stats['errors']}")
         
+        # Close Pipecat connection
         if self.pipecat_conn.state not in [ConnectionState.CLOSED, ConnectionState.CLOSING]:
             await self.pipecat_conn.close()
         
+        # Close Talkdesk connection
         if self.bridge_state != BridgeState.PIPECAT_CLOSED:
             try:
                 await self.talkdesk_ws.send_text(json.dumps({"event": "stop"}))
@@ -721,19 +705,20 @@ class BridgeSession:
                 pass
 
 ##############################################
-# FastAPI Endpoints
+# FastAPI Application
 ##############################################
+app = FastAPI()
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "service": "pipecat-cloud-bridge"}
+    return {"status": "ok", "service": "pipecat-twilio-bridge"}
 
 @app.websocket("/talkdesk")
 async def talkdesk_ws(ws: WebSocket):
     await ws.accept()
     session_id = str(uuid.uuid4())
-    logger.info(f"New TalkDesk connection – Session: {session_id}")
-    session = BridgeSession(session_id, ws, cfg)
+    logger.info(f"New Talkdesk connection - Session: {session_id}")
+    session = BridgeSession(session_id, ws)
     ACTIVE_SESSIONS[session_id] = session
 
     try:
@@ -744,14 +729,9 @@ async def talkdesk_ws(ws: WebSocket):
         ACTIVE_SESSIONS.pop(session_id, None)
         logger.info(f"Session {session_id} ended")
 
-##############################################
-# Pipecat Cloud Stats Function
-##############################################
-
 async def call_pipecat_stat_internal(call_id: str, interaction_id: str) -> Optional[Dict[str, Any]]:
-    """Call Pipecat Cloud statistics service (placeholder implementation)"""
+    """Call Pipecat statistics service (placeholder)"""
     try:
-        # For now return default data - you can implement actual Pipecat Cloud API call
         return {
             "success": True,
             "action": "transfer",
@@ -766,12 +746,7 @@ async def call_pipecat_stat_internal(call_id: str, interaction_id: str) -> Optio
         logger.error(f"Error calling pipecat_stat: {str(e)}")
         return None
 
-##############################################
-# Helper Functions (copied from original)
-##############################################
-
 def limita_testo_256(text):
-    """Limit text to 256 characters (copied from original)"""
     max_length = 240
     if len(text) <= max_length:
         return text
@@ -779,10 +754,9 @@ def limita_testo_256(text):
     last_space = truncated.rfind(" ")
     if last_space != -1:
         truncated = truncated[:last_space]
-    return truncated.strip() + ""
+    return truncated.strip()
 
 def build_talkdesk_message(stream_sid: str, pipecat_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Build TalkDesk escalation message (copied from original)"""
     action = "transfer"
     sentiment = "neutral"
     duration = "0"
@@ -816,13 +790,9 @@ def build_talkdesk_message(stream_sid: str, pipecat_data: Optional[Dict[str, Any
     }
     return stop_msg
 
-##############################################
-# Escalation Endpoint (copied from original)
-##############################################
-
 @app.post("/escalation")
 async def escalation(request: Request) -> Dict[str, Any]:
-    """Endpoint for handling escalation (compatible with existing system)"""
+    """Endpoint for handling escalation"""
     payload = await request.json()
     call_id = payload.get("message", {}).get("call", {}).get("id")
     tool_calls = payload.get("message", {}).get("toolCallList", []) or [{}]
@@ -846,54 +816,45 @@ async def escalation(request: Request) -> Dict[str, Any]:
             if session:
                 try:
                     await asyncio.sleep(1.5)
-                    logger.info(f"🔄 Starting immediate Pipecat Cloud closure for call {call_id}")
+                    logger.info(f"Starting escalation for call {call_id}")
                     
                     escalation_started = await session.start_escalation()
                     
                     if not escalation_started:
                         raise Exception("Failed to start escalation process")
                     
-                    logger.info(f"✅ Pipecat Cloud session closed immediately for call {call_id}")
+                    logger.info(f"Pipecat session closed for call {call_id}")
                     
-                    logger.info(f"⏳ Waiting for Pipecat Cloud to complete...")
                     await asyncio.sleep(2)
                     
-                    logger.info(f"📊 Fetching final call data...")
-                    
                     pipecat_data = await call_pipecat_stat_internal(call_id, interaction_id)
-                    
-                    if pipecat_data:
-                        logger.info(f"✅ Got Pipecat data successfully")
-                    else:
-                        logger.warning(f"⚠️ No Pipecat data received, using defaults")
                     
                     stop_msg = build_talkdesk_message(stream_sid, pipecat_data)
                     
                     escalation_completed = await session.complete_escalation(stop_msg)
                     
                     if escalation_completed:
-                        logger.info(f"📞 Escalation completed successfully: {stop_msg}")
-                        logger.info(f"✅ Escalation process finished for {stream_sid}")
+                        logger.info(f"Escalation completed successfully for {stream_sid}")
                     else:
                         raise Exception("Failed to complete escalation process")
                     
                 except Exception as e:
-                    logger.error(f"❌ Error during escalation: {str(e)}")
+                    logger.error(f"Error during escalation: {str(e)}")
                     
                     try:
-                        logger.info(f"🔄 Attempting fallback escalation with default data...")
+                        logger.info(f"Attempting fallback escalation...")
                         stop_msg = build_talkdesk_message(stream_sid, None)
                         
                         if session.bridge_state not in [BridgeState.CLOSED]:
                             await session.talkdesk_ws.send_text(json.dumps(stop_msg))
-                            logger.info(f"✅ Fallback escalation sent")
+                            logger.info(f"Fallback escalation sent")
                         else:
-                            logger.error(f"❌ Session already closed, cannot send fallback")
+                            logger.error(f"Session already closed, cannot send fallback")
                             
                     except Exception as fallback_error:
-                        logger.error(f"❌ Fallback escalation also failed: {str(fallback_error)}")
+                        logger.error(f"Fallback escalation failed: {str(fallback_error)}")
             else:
-                logger.warning(f"Escalation: no active session for streamSid {stream_sid}")
+                logger.warning(f"Escalation: no live session for streamSid {stream_sid}")
         else:
             logger.warning(f"Escalation: streamSid not found for call_id {call_id}")
     else:
