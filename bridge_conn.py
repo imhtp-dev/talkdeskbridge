@@ -78,6 +78,8 @@ class TalkDeskAudioInputProcessor(FrameProcessor):
         super().__init__(**kwargs)
         self.bridge_session = bridge_session
         self.audio_processor = AudioProcessor()
+        self._pipeline_ready = False
+        self._queued_audio = []  # Store audio until pipeline is ready
     
     async def process_frame(self, frame, direction: FrameDirection):
         # This processor mainly handles TalkDesk → Pipecat audio conversion
@@ -99,11 +101,41 @@ class TalkDeskAudioInputProcessor(FrameProcessor):
                 num_channels=1
             )
             
+            # Check if pipeline is ready
+            if not self._pipeline_ready:
+                # Queue audio until pipeline is ready (max 50 chunks to avoid memory issues)
+                if len(self._queued_audio) < 50:
+                    self._queued_audio.append(audio_frame)
+                    logger.debug(f"Queued audio chunk (queue size: {len(self._queued_audio)})")
+                else:
+                    logger.warning("Audio queue full, dropping oldest chunk")
+                    self._queued_audio.pop(0)
+                    self._queued_audio.append(audio_frame)
+                return
+            
             # Push to pipeline
             await self.push_frame(audio_frame, FrameDirection.DOWNSTREAM)
             
         except Exception as e:
             logger.error(f"Error processing TalkDesk audio: {e}")
+    
+    async def set_pipeline_ready(self):
+        """Mark pipeline as ready and process queued audio"""
+        logger.info(f"Pipeline ready! Processing {len(self._queued_audio)} queued audio chunks")
+        self._pipeline_ready = True
+        
+        # Process queued audio
+        for audio_frame in self._queued_audio:
+            try:
+                await self.push_frame(audio_frame, FrameDirection.DOWNSTREAM)
+                # Small delay to avoid overwhelming the pipeline
+                await asyncio.sleep(0.001)
+            except Exception as e:
+                logger.error(f"Error processing queued audio: {e}")
+        
+        # Clear the queue
+        self._queued_audio.clear()
+        logger.info("Queued audio processing complete")
 
 class TalkDeskAudioOutputProcessor(FrameProcessor):
     """Processes audio from Pipecat and sends to TalkDesk"""
@@ -210,7 +242,10 @@ class BridgeSession:
             
             # Start Pipecat pipeline
             self.pipeline_runner = PipelineRunner()
-            pipeline_task = asyncio.create_task(self.pipeline_runner.run(self.pipeline_task))
+            
+            # Wait for pipeline to be ready before processing audio
+            logger.info("Starting pipeline and waiting for readiness...")
+            pipeline_task = asyncio.create_task(self._run_pipeline_with_readiness_check())
             self.tasks.add(pipeline_task)
             
             # Wait for tasks to complete
@@ -221,12 +256,26 @@ class BridgeSession:
         finally:
             await self.stop()
     
+    async def _run_pipeline_with_readiness_check(self):
+        """Run pipeline"""
+        try:
+            # Run the pipeline (readiness is handled by transport event handlers)
+            await self.pipeline_runner.run(self.pipeline_task)
+            
+        except Exception as e:
+            logger.error(f"Pipeline error: {e}")
+            raise
+    
     def _setup_event_handlers(self):
         """Setup Pipecat transport event handlers"""
         
         @self.pipecat_transport.event_handler("on_connected")
         async def on_pipecat_connected(transport, connection):
             logger.info(f"Session {self.session_id}: Connected to Pipecat server")
+            # Additional small delay to ensure pipeline is fully ready
+            await asyncio.sleep(0.2)
+            logger.info("🟢 Pipeline connection established - enabling audio processing")
+            await self.input_processor.set_pipeline_ready()
         
         @self.pipecat_transport.event_handler("on_disconnected")
         async def on_pipecat_disconnected(transport, connection):
@@ -245,8 +294,10 @@ class BridgeSession:
         try:
             while self.is_active:
                 message = await self.talkdesk_ws.receive_text()
+                logger.info(f"🟡 RAW MESSAGE FROM TALKDESK: {message}")
                 data = json.loads(message)
                 event = data.get('event')
+                logger.info(f"🟢 PARSED EVENT: {event}")
                 
                 if event == 'start':
                     logger.info(f"Session {self.session_id}: Received START from TalkDesk")
@@ -261,12 +312,18 @@ class BridgeSession:
                 elif event == 'media':
                     # Process incoming audio from TalkDesk
                     media = data.get('media', {})
-                    if media.get('track') == 'inbound':
-                        payload = media.get('payload', '')
-                        
+                    track = media.get('track')
+                    payload = media.get('payload', '')
+                    
+                    logger.debug(f"🎵 Media event - track: {track}, payload_size: {len(payload) if payload else 0}")
+                    
+                    if track == 'inbound' and payload:
                         # Decode and process audio
                         mulaw_data = base64.b64decode(payload)
+                        logger.debug(f"🎤 Processing {len(mulaw_data)} bytes of audio data")
                         await self.input_processor.process_talkdesk_audio(mulaw_data)
+                    else:
+                        logger.debug(f"⏭️  Skipping media - track: {track}, has_payload: {bool(payload)}")
                         
         except Exception as e:
             logger.error(f"Session {self.session_id}: TalkDesk message handler error: {e}")
@@ -308,25 +365,21 @@ async def talkdesk_ws(ws: WebSocket):
     await ws.accept()
     session_id = str(uuid.uuid4())
     logger.info(f"New TalkDesk connection – Session: {session_id}")
+    
+    session = BridgeSession(session_id, ws)
+    ACTIVE_SESSIONS[session_id] = session
 
     try:
-        while True:
-            message = await ws.receive_text()
-            logger.info(f"🟡 RAW MESSAGE FROM TALKDESK: {message}")
-    
-            session = BridgeSession(session_id, ws)
-            ACTIVE_SESSIONS[session_id] = session
-
-            try:
-                await session.start()
-            except WebSocketDisconnect:
-                logger.info(f"Session {session_id} disconnected")
-            finally:
-                ACTIVE_SESSIONS.pop(session_id, None)
-                ACTIVE_SESSIONS.pop(session.stream_sid, None)
-                logger.info(f"Session {session_id} ended")
+        await session.start()
+    except WebSocketDisconnect:
+        logger.info(f"Session {session_id} disconnected")
     except Exception as e:
         logger.error(f"🔴 TalkDesk WebSocket error: {e}")
+    finally:
+        ACTIVE_SESSIONS.pop(session_id, None)
+        if session.stream_sid:
+            ACTIVE_SESSIONS.pop(session.stream_sid, None)
+        logger.info(f"Session {session_id} ended")
 
 if __name__ == "__main__":
     import uvicorn
