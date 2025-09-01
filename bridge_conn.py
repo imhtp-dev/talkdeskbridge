@@ -226,7 +226,7 @@ class BridgeSession:
         
         @self.pipecat_transport.event_handler("on_connected")
         async def on_pipecat_connected(transport, connection):
-            logger.success(f"Session {self.session_id}: Connected to Pipecat server")
+            logger.info(f"Session {self.session_id}: Connected to Pipecat server")
         
         @self.pipecat_transport.event_handler("on_disconnected")
         async def on_pipecat_disconnected(transport, connection):
