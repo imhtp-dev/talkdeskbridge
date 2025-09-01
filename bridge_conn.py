@@ -23,6 +23,7 @@ from typing import Dict
 
 import aiohttp
 import aiomysql
+import os
 
 ACTIVE_SESSIONS: Dict[str, "BridgeSession"] = {}
 
@@ -119,7 +120,8 @@ PORT = 8080
 # URL del server Pipecat
 #PIPECAT_SERVER_URL ="wss://voiladevpipecat-e9g6f7bxhhgreefq.francecentral-01.azurewebsites.net/ws"
 #PIPECAT_SERVER_URL="wss://2f26d18c02d3.ngrok.app"
-PIPECAT_SERVER_URL="wss://fe38b408791c.ngrok-free.app" #Rudy Mac
+#PIPECAT_SERVER_URL="wss://fe38b408791c.ngrok-free.app" #Rudy Mac
+PIPECAT_SERVER_URL = os.environ.get('PIPECAT_SERVER_URL')
 PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
