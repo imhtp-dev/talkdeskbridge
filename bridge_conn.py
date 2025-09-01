@@ -287,7 +287,14 @@ class BridgeSession:
         
         # Close transport
         if self.pipecat_transport:
-            await self.pipecat_transport.close()
+            try:
+                # WebsocketClientTransport cleanup
+                if hasattr(self.pipecat_transport, 'cleanup'):
+                    await self.pipecat_transport.cleanup()
+                elif hasattr(self.pipecat_transport, 'stop'):
+                    await self.pipecat_transport.stop()
+            except Exception as e:
+                logger.error(f"Error closing transport: {e}")
 
 ##############################################
 # FastAPI Endpoints
