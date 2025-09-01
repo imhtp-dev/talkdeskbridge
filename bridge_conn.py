@@ -118,7 +118,7 @@ PORT = 8080
 
 # URL del server Pipecat
 #PIPECAT_SERVER_URL ="wss://voiladevpipecat-e9g6f7bxhhgreefq.francecentral-01.azurewebsites.net/ws"
-PIPECAT_SERVER_URL="wss://d2df73c8712d.ngrok.app"
+PIPECAT_SERVER_URL="wss://2f26d18c02d3.ngrok.app"
 PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
