@@ -121,7 +121,7 @@ PORT = 8080
 #PIPECAT_SERVER_URL ="wss://voiladevpipecat-e9g6f7bxhhgreefq.francecentral-01.azurewebsites.net/ws"
 #PIPECAT_SERVER_URL="wss://2f26d18c02d3.ngrok.app"
 #PIPECAT_SERVER_URL="wss://fe38b408791c.ngrok-free.app" #Rudy Mac
-PIPECAT_SERVER_URL = os.environ.get('PIPECAT_SERVER_URL')
+PIPECAT_SERVER_URL = os.getenv("PIPECAT_SERVER_URL", "ws://localhost:8765")
 PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
