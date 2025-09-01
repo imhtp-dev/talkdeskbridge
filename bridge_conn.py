@@ -308,18 +308,25 @@ async def talkdesk_ws(ws: WebSocket):
     await ws.accept()
     session_id = str(uuid.uuid4())
     logger.info(f"New TalkDesk connection – Session: {session_id}")
-    
-    session = BridgeSession(session_id, ws)
-    ACTIVE_SESSIONS[session_id] = session
 
     try:
-        await session.start()
-    except WebSocketDisconnect:
-        logger.info(f"Session {session_id} disconnected")
-    finally:
-        ACTIVE_SESSIONS.pop(session_id, None)
-        ACTIVE_SESSIONS.pop(session.stream_sid, None)
-        logger.info(f"Session {session_id} ended")
+        while True:
+            message = await ws.receive_text()
+            logger.info(f"🟡 RAW MESSAGE FROM TALKDESK: {message}")
+    
+            session = BridgeSession(session_id, ws)
+            ACTIVE_SESSIONS[session_id] = session
+
+            try:
+                await session.start()
+            except WebSocketDisconnect:
+                logger.info(f"Session {session_id} disconnected")
+            finally:
+                ACTIVE_SESSIONS.pop(session_id, None)
+                ACTIVE_SESSIONS.pop(session.stream_sid, None)
+                logger.info(f"Session {session_id} ended")
+    except Exception as e:
+        logger.error(f"🔴 TalkDesk WebSocket error: {e}")
 
 if __name__ == "__main__":
     import uvicorn
