@@ -7,4 +7,4 @@ aiohttp>=3.11.12,<4
 python-multipart==0.0.6
 
 # Pipecat WebSocket transport dependencies
-pipecat-ai[websocket]>=0.0.1
+pipecat-ai[websocket]>=0.0.82
