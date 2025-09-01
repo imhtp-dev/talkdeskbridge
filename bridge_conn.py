@@ -25,7 +25,7 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 # Configuration
 ##############################################
 PORT = 8080
-PIPECAT_SERVER_URL = os.getenv("PIPECAT_SERVER_URL", "ws://7c024f642432.ngrok-free.app")  # Pipecat WebSocket server URL
+PIPECAT_SERVER_URL = os.getenv("PIPECAT_SERVER_URL", "http://localhost:8765")  # Pipecat WebSocket server URL
 
 logging.basicConfig(
     level=logging.INFO,
