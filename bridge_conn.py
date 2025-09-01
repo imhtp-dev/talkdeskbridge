@@ -14,12 +14,34 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, Set
 import time
 from pipecat.transports.network.websocket_client import WebsocketClientTransport, WebsocketClientParams
-from pipecat.serializers.protobuf import ProtobufFrameSerializer
-from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame
+from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.frames.frames import InputAudioRawFrame, OutputAudioRawFrame, Frame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
+##############################################
+# Custom RawPCM Serializer (same as working client)
+##############################################
+class RawPCMSerializer(FrameSerializer):
+    @property
+    def type(self):
+        return FrameSerializerType.BINARY
+    
+    async def serialize(self, frame) -> bytes:
+        if isinstance(frame, OutputAudioRawFrame):
+            return frame.audio
+        return b''
+    
+    async def deserialize(self, data) -> Frame:
+        if isinstance(data, bytes) and len(data) > 0:
+            return InputAudioRawFrame(
+                audio=data,
+                sample_rate=16000,
+                num_channels=1
+            )
+        return None
 
 ##############################################
 # Configuration
@@ -212,7 +234,7 @@ class BridgeSession:
                     audio_in_enabled=True,
                     audio_out_enabled=True,
                     add_wav_header=False,
-                    serializer=ProtobufFrameSerializer()
+                    serializer=RawPCMSerializer()
                 )
             )
             
