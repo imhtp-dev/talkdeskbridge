@@ -20,9 +20,10 @@ import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import time
 from typing import Dict
-import os
+
 import aiohttp
 import aiomysql
+import os
 
 ACTIVE_SESSIONS: Dict[str, "BridgeSession"] = {}
 
@@ -118,7 +119,9 @@ PORT = 8080
 
 # URL del server Pipecat
 #PIPECAT_SERVER_URL ="wss://voiladevpipecat-e9g6f7bxhhgreefq.francecentral-01.azurewebsites.net/ws"
-PIPECAT_SERVER_URL= os.getenv("PIPECAT_SERVER_URL", "ws://localhost:8765")
+#PIPECAT_SERVER_URL="wss://2f26d18c02d3.ngrok.app"
+#PIPECAT_SERVER_URL="wss://fe38b408791c.ngrok-free.app" #Rudy Mac
+PIPECAT_SERVER_URL = os.getenv("PIPECAT_SERVER_URL", "ws://localhost:8765")
 PIPECAT_ASSISTANT_ID = "12689"
 
 logging.basicConfig(
@@ -154,7 +157,7 @@ class BridgeConfig:
     pipecat_server_url: str = PIPECAT_SERVER_URL
     pipecat_assistant_id: str = PIPECAT_ASSISTANT_ID
     talkdesk_sample_rate: int = 8000
-    pipecat_sample_rate: int = 8000  # Changed to 8000 for mulaw optimization
+    pipecat_sample_rate: int = 16000
     channels: int = 1
     chunk_size: int = 160
 
@@ -602,10 +605,16 @@ class BridgeSession:
                             if media.get('track') == 'inbound':
                                 payload = media.get('payload', '')
                                 mulaw_data = base64.b64decode(payload)
+                                pcm_8khz = self.audio_processor.mulaw_to_pcm(mulaw_data)
+                                pcm_16khz = self.audio_processor.resample(
+                                    pcm_8khz,
+                                    self.config.talkdesk_sample_rate,
+                                    self.config.pipecat_sample_rate,
+                                    self.config.channels
+                                )
                                 
-                                # OPTIMIZED: Buffer mulaw directly (no conversion/resampling)
-                                if mulaw_data:
-                                    self.audio_buffer.append(mulaw_data)
+                                # Buffer l'audio invece di inviarlo
+                                self.audio_buffer.append(pcm_16khz)
                                 
                                 # Limita la dimensione del buffer
                                 if len(self.audio_buffer) > 100:
@@ -620,10 +629,16 @@ class BridgeSession:
                                 payload = media.get('payload', '')
                                 
                                 mulaw_data = base64.b64decode(payload)
+                                pcm_8khz = self.audio_processor.mulaw_to_pcm(mulaw_data)
+                                pcm_16khz = self.audio_processor.resample(
+                                    pcm_8khz,
+                                    self.config.talkdesk_sample_rate,
+                                    self.config.pipecat_sample_rate,
+                                    self.config.channels
+                                )
                                 
-                                # OPTIMIZED: Send mulaw directly (no conversion/resampling)
                                 try:
-                                    await self.pipecat_conn.send_audio(mulaw_data)
+                                    await self.pipecat_conn.send_audio(pcm_16khz)
                                     self.stats['talkdesk_to_pipecat_packets'] += 1
                                 except Exception:
                                     pass
@@ -658,8 +673,19 @@ class BridgeSession:
                     data = await self.pipecat_conn.receive()
                     
                     if isinstance(data, bytes) and len(data) > 0:
-                        # OPTIMIZED: Pipecat now sends mulaw directly at 8kHz
-                        mulaw_data = data
+                        # Pipecat invia PCM a 16kHz
+                        pcm_16khz = data
+                        
+                        # Resample a 8kHz per Talkdesk
+                        pcm_8khz = self.audio_processor.resample(
+                            pcm_16khz,
+                            self.config.pipecat_sample_rate,
+                            self.config.talkdesk_sample_rate,
+                            self.config.channels
+                        )
+                        
+                        # Converti in μ-law
+                        mulaw_data = self.audio_processor.pcm_to_mulaw(pcm_8khz)
                         payload = base64.b64encode(mulaw_data).decode()
                         
                         self.chunk_counter += 1
