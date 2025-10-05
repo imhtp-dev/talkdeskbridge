@@ -212,16 +212,18 @@ class PipecatConnection:
         self.state = ConnectionState.INIT
         self.session_data: Dict[str, Any] = {}
         
-    async def create_connection(self, business_status: str = "close") -> Dict[str, Any]:
+    async def create_connection(self, business_status: str = "close", caller_phone: str = "") -> Dict[str, Any]:
         """Crea una nuova connessione WebSocket con Pipecat"""
         try:
             self.state = ConnectionState.CONNECTING
-            
+
             # Genera un call_id univoco per questa sessione
             self.call_id = str(uuid.uuid4())
-            
-            # Costruisci l'URL con i parametri
-            ws_url = f"{self.config.pipecat_server_url}?business_status={business_status}&session_id={self.call_id}"
+
+            # Costruisci l'URL con i parametri incluso caller_phone
+            from urllib.parse import quote
+            encoded_phone = quote(caller_phone) if caller_phone else ""
+            ws_url = f"{self.config.pipecat_server_url}?business_status={business_status}&session_id={self.call_id}&caller_phone={encoded_phone}"
             self.websocket_url = ws_url
             
             logger.info(f"Creating Pipecat connection with business_status: {business_status}")
@@ -353,9 +355,9 @@ class BridgeSession:
         """Inizializza Pipecat con il business_status corretto"""
         try:
             logger.info(f"Session {self.session_id}: Initializing Pipecat with business_status: {business_status}")
-            
-            # Crea la connessione Pipecat con il business_status corretto
-            await self.pipecat_conn.create_connection(business_status)
+
+            # Crea la connessione Pipecat con il business_status corretto e caller_id
+            await self.pipecat_conn.create_connection(business_status, self.caller_id or "")
             await self.pipecat_conn.connect()
             
             # Cambia stato a ACTIVE
